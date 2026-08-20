@@ -57,3 +57,18 @@ updates:
     commit-message:
       prefix: build
       include: scope
+
+  # The actionlint the lint workflow runs, pinned in a dockerfile beside it
+  # because dependabot cannot see an image named in a workflow. Kept apart from
+  # the build above so bumping a lint tool reads as the CI change it is.
+  - package-ecosystem: docker
+    directory: /.github/workflows
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: ci
+      include: scope

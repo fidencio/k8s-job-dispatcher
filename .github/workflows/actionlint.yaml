@@ -50,10 +50,20 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
-        with:
-          tool: actionlint
-      # actionlint shells out to shellcheck for every `run:` block, and silently
-      # skips that half of its checks when it is missing.
-      - run: shellcheck --version
-      - run: actionlint -color
+      - name: Read the pinned image
+        id: pin
+        run: |
+          image="$(sed -n 's|^FROM ||p' .github/workflows/actionlint.dockerfile)"
+          test -n "${image}" || {
+            echo "::error::no FROM line in .github/workflows/actionlint.dockerfile"
+            exit 1
+          }
+          echo "image=${image}" >> "${GITHUB_OUTPUT}"
+
+      # The upstream image, because install-action has no actionlint manifest.
+      # It also carries the shellcheck actionlint shells out to for every `run:`
+      # block, whose absence would silently skip half its checks.
+      - name: Run actionlint
+        env:
+          IMAGE: ${{ steps.pin.outputs.image }}
+        run: docker run --rm -v "${PWD}:/repo" -w /repo "${IMAGE}" -color
