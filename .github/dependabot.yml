@@ -1,0 +1,59 @@
+# Dependabot version-update configuration.
+#
+# Security alerts and security-update PRs are configured separately in the
+# repository settings. This file only governs scheduled version-update PRs.
+#
+# https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    # A compromised crate is usually yanked within days, so waiting keeps it
+    # from being pulled in automatically the moment it ships.
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: deps
+      include: scope
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: ci
+      include: scope
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  # This is what keeps the build on a current Rust: the base stage pins an exact
+  # rust:<version> image, so a new release arrives here as a reviewable PR whose
+  # CI proves the compiler still builds us. CI reads its own toolchain out of
+  # that same line, so this one bump moves everything.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: build
+      include: scope

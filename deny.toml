@@ -1,0 +1,42 @@
+# cargo-deny configuration -- https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+db-urls = ["https://github.com/rustsec/advisory-db"]
+ignore = []
+
+[licenses]
+version = 2
+# An allow-list rather than a deny-list: a dependency arriving under a licence
+# nobody considered should fail, not pass by default. Every entry below is here
+# because something in the current tree needs it.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    # rustls' TLS stack: rustls-webpki and untrusted are ISC-only, and ring is
+    # Apache-2.0 AND ISC, so ISC cannot be satisfied by picking MIT instead.
+    "ISC",
+    # unicode-ident carries the Unicode data licence alongside MIT/Apache-2.0.
+    "Unicode-3.0",
+    # subtle, via sha2's constant-time primitives.
+    "BSD-3-Clause",
+]
+confidence-threshold = 0.8
+
+[bans]
+# A duplicated crate is a slower build and a bigger image, not a correctness
+# problem, and the fix usually belongs to a dependency rather than to us.
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+# Anything not from crates.io means a build nobody can reproduce from the lock
+# file alone.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

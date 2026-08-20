@@ -1,0 +1,35 @@
+name: Install the Rust toolchain the image is built with
+description: >
+  Installs the compiler named by the Dockerfile's builder stage, which is the one
+  the released binary is built with. Reading it from there rather than repeating
+  it here means the two cannot disagree, and that a new compiler arrives as a
+  single dependabot bump whose CI proves it still builds us.
+
+inputs:
+  components:
+    description: Components to install on top of the default profile
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Read the version out of the Dockerfile
+      id: pin
+      shell: bash
+      # Fails rather than falling back to a default: testing with a different
+      # compiler than the release image is built with is the thing being
+      # prevented, and a silent fallback is how that would happen.
+      run: |
+        channel="$(sed -n 's|^FROM rust:\([^-]*\)-.* AS rust-base|\1|p' Dockerfile)"
+        test -n "${channel}" || {
+          echo "::error::no rust-base stage in Dockerfile to read the version from"
+          exit 1
+        }
+        echo "channel=${channel}" >> "${GITHUB_OUTPUT}"
+
+    - name: Install it
+      uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-05
+      with:
+        toolchain: ${{ steps.pin.outputs.channel }}
+        components: ${{ inputs.components }}

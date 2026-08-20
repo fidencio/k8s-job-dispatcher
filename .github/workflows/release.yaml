@@ -1,0 +1,241 @@
+# Copyright (c) 2026 Kata Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# Only amd64 and arm64 have GitHub-hosted native runners, so ppc64le and s390x
+# compile under emulation. That is slow, but it is a per-release cost and it
+# keeps one Dockerfile for every architecture.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Lets a release be re-cut without moving the tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (defaults to the current ref)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: build and push
+    runs-on: ubuntu-24.04
+    # Generous: ppc64le and s390x compile under emulation. Still bounded, since
+    # a wedged emulated build would otherwise hold a runner for six hours.
+    timeout-minutes: 120
+    permissions:
+      # contents to cut the release, id-token and attestations to sign what it
+      # contains: a release nobody can verify is only marginally better than a
+      # build somebody did on a laptop.
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+
+      # Registers the binfmt handlers for the three architectures the runner
+      # cannot execute itself.
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `latest=auto` moves :latest only for a non-prerelease semver tag, so
+      # cutting an -rc does not become what everybody pulls by default.
+      - name: Derive the image tags
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: latest=auto
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      # buildx's inline provenance is off because it adds "unknown/unknown"
+      # entries to the manifest list, which some consumers read as a platform
+      # they cannot use. The attestation below records the same thing as an OCI
+      # referrer instead, which leaves the manifest list alone.
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64,linux/ppc64le,linux/s390x
+          push: true
+          provenance: false
+          sbom: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # For consumers packaging this themselves rather than running the image.
+      # The layers were just built, so this exports rather than rebuilds.
+      - name: Export the binaries
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          target: binary
+          platforms: linux/amd64,linux/arm64,linux/ppc64le,linux/s390x
+          outputs: type=local,dest=dist
+          cache-from: type=gha
+
+      # tar records mtimes, owners and order, and gzip stamps the time: left
+      # alone, two builds of one commit differ and nobody can reproduce either.
+      - name: Package them
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          mkdir -p out
+          epoch="$(git log -1 --pretty=%ct)"
+          for dir in dist/linux_*; do
+            arch="${dir#dist/linux_}"
+            tar --sort=name --owner=0 --group=0 --numeric-owner \
+              --mtime="@${epoch}" -cf - \
+              -C "${dir}" k8s-job-dispatcher \
+              -C "${GITHUB_WORKSPACE}" LICENSE \
+              | gzip -n -9 > "out/k8s-job-dispatcher-${VERSION}-linux-${arch}.tar.gz"
+          done
+
+      # From Cargo.lock rather than the binary: syft reads the resolved crate
+      # graph there, while a stripped binary tells it only its own name. One file
+      # covers every architecture, since the lockfile is what they all build.
+      - uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+
+      - name: Generate the SBOM
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          syft scan file:Cargo.lock -o spdx-json \
+            > "out/k8s-job-dispatcher-${VERSION}.spdx.json"
+
+      # Cheap to check, and the only thing a consumer without the gh CLI can
+      # check at all.
+      - name: Checksum everything
+        run: |
+          (cd out && sha256sum -- *.tar.gz *.spdx.json > SHA256SUMS)
+          ls -l out
+
+      - name: Attest the release files
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: out/*
+
+      # A consumer resolving one platform out of the index pins the child digest,
+      # not the index digest, so attesting only the index leaves that lookup with
+      # nothing to verify. Each subject needs its own call.
+      - name: Read the per-architecture digests out of the index
+        id: children
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --raw \
+            | jq -r '.manifests[]
+                     | select(.platform.os == "linux")
+                     | "\(.platform.architecture)=\(.digest)"' \
+            | tee -a "${GITHUB_OUTPUT}"
+
+      # By digest, so this covers what was pushed rather than what a tag points
+      # at when somebody looks.
+      - name: Attest the index
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attest amd64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.children.outputs.amd64 }}
+          push-to-registry: true
+
+      - name: Attest arm64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.children.outputs.arm64 }}
+          push-to-registry: true
+
+      - name: Attest ppc64le
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.children.outputs.ppc64le }}
+          push-to-registry: true
+
+      - name: Attest s390x
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.children.outputs.s390x }}
+          push-to-registry: true
+
+      # The image carries no shell, so a missing shared library on one
+      # architecture would otherwise be found by whoever deployed it.
+      - name: Smoke test every published architecture
+        env:
+          # Through the environment rather than inlined, so a tag cannot become
+          # part of the command.
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          tag="$(printf '%s' "${TAGS}" | head -n1)"
+          for platform in linux/amd64 linux/arm64 linux/ppc64le linux/s390x; do
+            echo "::group::${platform}"
+            docker run --rm --platform "${platform}" "${tag}" --version
+            echo "::endgroup::"
+          done
+
+      # Last, so nothing is announced that failed to build, verify or start.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          notes="$(cat <<EOF
+          Image: \`ghcr.io/${GITHUB_REPOSITORY}:${VERSION}\`
+
+          The amd64 and arm64 binaries are statically linked. The ppc64le and
+          s390x ones are not: they need glibc and libgcc_s.so.1 on the host.
+
+          Every file here is attested, as is the index and each architecture
+          within it, so a per-platform digest can be verified directly:
+
+              gh attestation verify <file> --repo ${GITHUB_REPOSITORY}
+              gh attestation verify oci://ghcr.io/${GITHUB_REPOSITORY}@<digest> \\
+                --repo ${GITHUB_REPOSITORY} --bundle-from-oci
+
+          The SBOM is SPDX, resolved from Cargo.lock, so it covers every
+          architecture.
+          EOF
+          )"
+          prerelease=()
+          # A tag with a suffix is an -rc or similar, and should not be what
+          # "latest release" resolves to.
+          case "${TAG}" in *-*) prerelease=(--prerelease) ;; esac
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" out/* --clobber
+          else
+            gh release create "${TAG}" out/* --verify-tag \
+              --title "${TAG}" --notes "${notes}" "${prerelease[@]}"
+          fi

@@ -1,0 +1,57 @@
+# Copyright (c) 2026 Kata Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# Overlaps with `cargo audit`, deliberately: this reads Cargo.lock against the
+# OSV database rather than RustSec, so an advisory published to only one of the
+# two is still seen.
+
+name: OSV-Scanner
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  merge_group:
+    branches:
+      - main
+  schedule:
+    - cron: "0 0 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  # The PR variant reports only what the PR introduces; a branch scan reports
+  # everything, which on a PR would fail for problems it did not cause.
+  #
+  # Neither carries a timeout-minutes like every other job here: that key is not
+  # permitted on a job that calls a reusable workflow.
+  scan-pr:
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@6e4298ebc4db23e847df9b2e2de2939d6f066c67 # v2.5.1
+    with:
+      scan-args: |-
+        -r
+        --skip-git
+        ./
+
+  scan-branch:
+    if: ${{ github.event_name == 'push' || github.event_name == 'schedule' }}
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@6e4298ebc4db23e847df9b2e2de2939d6f066c67 # v2.5.1
+    with:
+      scan-args: |-
+        -r
+        --skip-git
+        ./

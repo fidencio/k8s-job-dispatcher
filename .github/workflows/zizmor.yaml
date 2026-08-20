@@ -1,0 +1,42 @@
+# Copyright (c) 2026 Kata Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# Audits the workflows themselves for the mistakes that leak a token: unpinned
+# actions, script injection through untrusted `github.*` values, over-broad
+# permissions, and credentials left in the checkout.
+
+name: zizmor
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: "0 0 * * *"
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  zizmor:
+    name: zizmor
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # Findings land in the Security tab rather than only in a job log.
+      security-events: write
+      # Lets zizmor resolve the actions the workflows reference.
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: zizmorcore/zizmor-action@3dc1ecc9bcb9e94e9b2c709687979e1298497054 # v0.6.2

@@ -1,0 +1,58 @@
+[package]
+name = "k8s-job-dispatcher"
+version = "0.1.0"
+authors = ["The Kata Containers community <kata-dev@lists.katacontainers.io>"]
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.90"
+description = "Run one node-pinned Kubernetes Job per selected node, paced and with guaranteed per-node coverage."
+repository = "https://github.com/kata-containers/k8s-job-dispatcher"
+readme = "README.md"
+keywords = ["kubernetes", "job", "daemonset", "node", "rollout"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "k8s-job-dispatcher"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.103"
+clap = { version = "4.5.40", features = ["derive"] }
+env_logger = "0.11"
+# /configz reports runtimeRequestTimeout Go-style ("2m0s").
+humantime = "2.1.0"
+json-patch = "4"
+k8s-openapi = { version = "0.26", default-features = false, features = [
+    "v1_33",
+] }
+# Jobs are driven by polling with Api::get, so kube::runtime and kube::derive
+# stay out. `ring` matches kube's default rustls CryptoProvider and must stay
+# enabled, otherwise rustls panics at startup.
+kube = { version = "2.0", default-features = false, features = [
+    "client",
+    "jsonpatch",
+    "rustls-tls",
+    "ring",
+] }
+log = "0.4.14"
+serde_json = "1.0.91"
+serde_yaml = "0.9"
+sha2 = "0.10"
+tokio = { version = "1.46.1", features = [
+    "rt-multi-thread",
+    "macros",
+    "signal",
+    "time",
+] }
+
+[dev-dependencies]
+rstest = "0.26.1"
+
+# Shipped in an image and never hot, so size beats throughput. `panic` stays at
+# "unwind": a panicking post-success task is reported per node through JoinError
+# rather than taking the whole run down.
+[profile.release]
+opt-level = "z"
+codegen-units = 1
+lto = true
+strip = true

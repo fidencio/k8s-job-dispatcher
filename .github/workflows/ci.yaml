@@ -1,0 +1,300 @@
+# Copyright (c) 2026 Kata Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+  # A nightly run is what catches a freshly published advisory without waiting
+  # for somebody to open a PR. It does not catch a new stable Rust: the compiler
+  # is the one the Dockerfile names, and that moves by review.
+  schedule:
+    - cron: "0 0 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-24.04
+    # Every job is bounded: a hung one otherwise occupies a runner for the six
+    # hours GitHub allows before it steps in.
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      image: ${{ steps.filter.outputs.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: |
+            code:
+              - '**/*.rs'
+              - '**/*.toml'
+              - '**/*.lock'
+              - '.cargo/**'
+              - '.github/actions/**'
+              - '.github/workflows/ci.yaml'
+              # The compiler these jobs run comes from the Dockerfile, so a bump
+              # of it has to rebuild and retest with what it just asked for.
+              - 'Dockerfile'
+            image:
+              - 'Dockerfile'
+              - '.dockerignore'
+              - '**/*.rs'
+              - '**/*.toml'
+              - '**/*.lock'
+              - '.github/workflows/ci.yaml'
+
+  formatting:
+    name: cargo fmt
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' || github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  linting:
+    name: cargo clippy
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' || github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # A failed lint still leaves the dependency build behind, and a retry
+          # should not pay for it twice.
+          cache-on-failure: true
+      # --locked, so a Cargo.lock that does not match the manifests fails here
+      # rather than resolving to something else than the release build.
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  test:
+    name: cargo test
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' || github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: true
+      - run: cargo test --locked --all-features -- --include-ignored
+
+  docs:
+    name: cargo doc
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' || github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo doc --no-deps --all-features --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    name: minimum supported Rust version
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' || github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # rust-version is a promise to whoever vendors this, and nothing else here
+      # would notice it drifting.
+      - name: Read the MSRV from Cargo.toml
+        id: msrv
+        run: |
+          msrv="$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)"
+          test -n "${msrv}" || { echo "::error::no rust-version in Cargo.toml"; exit 1; }
+          echo "version=${msrv}" >> "${GITHUB_OUTPUT}"
+      - name: Install the declared MSRV toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-05
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo build --locked --all-targets
+
+  # No separate `cargo audit` job: cargo-deny's advisories check reads the same
+  # RustSec database, and also covers licences, banned crates and sources.
+  deny:
+    name: cargo deny
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' || github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+      # Prebuilt, so this does not compile the tool from source on every run.
+      - uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+        with:
+          tool: cargo-deny
+      - run: cargo deny check --locked
+
+  unused-deps:
+    name: cargo udeps
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' || github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # udeps needs nightly-only -Z flags.
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-05
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+        with:
+          tool: cargo-udeps
+      - run: cargo udeps --locked --all-features
+
+  hadolint:
+    name: hadolint
+    needs: changes
+    if: ${{ needs.changes.outputs.image == 'true' || github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: hadolint/hadolint-action@2a66e89f53d0771bb131a7fa31f3136336094aa6 # v3.4.0
+        with:
+          dockerfile: Dockerfile
+
+  # Every architecture, because they are not the same build: three link
+  # statically against musl and one against glibc, so a release is the wrong
+  # place to find out that one of them does not compile or start.
+  image:
+    name: container image (${{ matrix.arch }})
+    needs: changes
+    if: ${{ needs.changes.outputs.image == 'true' || github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    # Generous because three of the four are emulated, which costs roughly an
+    # order of magnitude.
+    timeout-minutes: 90
+    strategy:
+      # One architecture failing is a fact worth having about the others.
+      fail-fast: false
+      matrix:
+        arch:
+          - amd64
+          - arm64
+          - ppc64le
+          - s390x
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Register the binfmt handlers
+        if: ${{ matrix.arch != 'amd64' }}
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      # The Dockerfile builds dependencies against a placeholder entry point in
+      # their own layer, so this cache turns a source-only change into a rebuild
+      # of just this crate. Scoped per architecture, which share no layers.
+      - name: Build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          tags: k8s-job-dispatcher:ci-${{ matrix.arch }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      # The image carries no shell, so a missing shared library shows up only
+      # when the binary is actually started.
+      - name: Smoke test
+        env:
+          IMAGE: k8s-job-dispatcher:ci-${{ matrix.arch }}
+          PLATFORM: linux/${{ matrix.arch }}
+        run: |
+          docker run --rm --platform "${PLATFORM}" "${IMAGE}" --version
+          docker run --rm --platform "${PLATFORM}" "${IMAGE}" --help > /dev/null
+
+      # A release ships this stage too, and it is a separate build target.
+      - name: Export the binary
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          target: binary
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=local,dest=dist
+          cache-from: type=gha,scope=${{ matrix.arch }}
+
+      # The linkage is the whole reason this file has per-architecture stages,
+      # and nothing else would notice it quietly going back to glibc everywhere.
+      - name: Check its linkage
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          file dist/k8s-job-dispatcher
+          case "${ARCH}" in
+            ppc64le | s390x) want="dynamically linked" ;;
+            *) want="static" ;;
+          esac
+          file dist/k8s-job-dispatcher | grep -q "${want}" || {
+            echo "::error::${ARCH} binary is not ${want}"
+            exit 1
+          }
