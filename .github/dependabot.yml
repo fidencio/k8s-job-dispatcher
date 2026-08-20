@@ -21,6 +21,10 @@ updates:
       prefix: deps
       include: scope
     groups:
+      kube:
+        patterns:
+          - kube
+          - k8s-openapi
       cargo-minor-patch:
         update-types:
           - minor
