@@ -1204,12 +1204,10 @@ mod tests {
     #[test]
     fn only_conflicts_are_retried() {
         let status = |code: u16| {
-            kube::Error::Api(kube::error::ErrorResponse {
-                status: String::new(),
-                message: String::new(),
-                reason: String::new(),
-                code,
-            })
+            kube::Error::Api(
+                serde_json::from_value(serde_json::json!({"status": "Failure", "code": code}))
+                    .expect("an apiserver failure status"),
+            )
         };
 
         assert!(is_precondition_failure(&status(409)));
