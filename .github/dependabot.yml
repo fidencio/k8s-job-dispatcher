@@ -21,6 +21,15 @@ updates:
       prefix: deps
       include: scope
     groups:
+      # kube requires an exact k8s-openapi minor, and k8s-openapi's build script
+      # refuses to compile a copy of itself that has no v1_* feature enabled.
+      # Bumped apart, either PR leaves two copies in the graph with the feature
+      # on one of them, so neither can build. Listed first: a dependency joins
+      # the first group it matches.
+      kube:
+        patterns:
+          - kube
+          - k8s-openapi
       cargo-minor-patch:
         update-types:
           - minor
