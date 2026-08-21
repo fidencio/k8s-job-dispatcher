@@ -352,6 +352,61 @@ instance's mark is left:
 Without `--instance-label-prefix` there is assumed to be a single instance, which
 owns the shared key outright.
 
+## Running on a schedule
+
+A run reaches the nodes that exist while it runs. A node that joins the cluster
+afterwards matches the same selector and was never dispatched to, and nothing
+comes back for it — where a DaemonSet would have covered it without being asked.
+A CronJob is that "asked", and three flags exist for it:
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          containers:
+            - name: dispatcher
+              args:
+                - --owner-job-from-pod=$(POD_NAME)
+                - --yield-to-live-run
+                - --skip-satisfied-nodes
+                - --wait-for-nodes-secs=0
+                # and the same template, selectors and labelling flags as the
+                # run that installed the fleet in the first place
+              env:
+                - name: POD_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.name
+```
+
+`--wait-for-nodes-secs=0` because that flag declares nodes are *expected* and
+makes an empty selection an error, which for something periodic should be a quiet
+no-op. It also switches off settling, so a run can catch a fleet mid-labelling and
+dispatch to part of it — the rest arrive on the next one. Both are the opposite of
+what a one-shot run wants, so do not copy its values here.
+
+`concurrencyPolicy: Forbid` keeps two of these from overlapping, and
+`--yield-to-live-run` covers what it cannot: an upgrade running while one of these
+is mid-rollout. `backoffLimit: 0` because a run that failed on a node should
+surface as a failed Job rather than be retried immediately — the next run is the
+retry, and a `CronJob` whose last runs all failed is the alert.
+
+Whether these runs also tear down nodes that have fallen out of the selection is
+decided by whether `--cleanup-job-template` is passed. Leaving it out is the
+conservative default: a node dropping out is usually a label gone wrong somewhere,
+and dismantling a host on a timer with nobody watching is worse than a stale node
+waiting for the next upgrade to clean it up.
+
 ## Building
 
 ```bash

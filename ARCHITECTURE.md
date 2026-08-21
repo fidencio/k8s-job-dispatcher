@@ -622,5 +622,9 @@ to make progress at all. `--yield-to-live-run` is not that guarantee either: a
 run that sees another one's Jobs stands aside, and two runs starting close enough
 together that neither sees the other's still fall back on the same arithmetic.
 
-Consequently, an operator wanting steady-state enforcement should run this on a
-schedule or as an upgrade hook, and read a non-zero exit as the signal it is.
+Consequently, reaching a node that appears later is a matter of running this
+again: as an upgrade hook for a change, or [on a
+schedule](README.md#running-on-a-schedule) for nodes that joined since. The
+second of those is coverage and not enforcement — a run can tell that no run has
+finished on a node, not that what finished is out of date — and either way a
+non-zero exit is the signal it is.
