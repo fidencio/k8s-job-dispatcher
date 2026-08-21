@@ -15,7 +15,7 @@ mod node_filter;
 mod nodes;
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use job::{
     build_node_job, interpret_status, job_name, job_owned_by, sanitize_label_value, JobOutcome,
     TrackingLabels, DEFAULT_TRACKING_LABEL_PREFIX,
@@ -48,7 +48,8 @@ const JOB_GET_TIMEOUT: Duration = Duration::from_secs(15);
 #[command(
     author,
     version,
-    about = "Run one node-pinned Job per selected node, paced and with guaranteed coverage."
+    about = "Run one node-pinned Job per selected node, paced and with guaranteed coverage.",
+    group(ArgGroup::new("owner").args(["owner_job_name", "owner_job_from_pod"]))
 )]
 struct Args {
     /// Path to a YAML file containing the batch/v1 Job to run on each node. It is
@@ -119,8 +120,13 @@ struct Args {
     /// Same owner, taken from the Job that created this pod, for a run that cannot
     /// name its own Job: a CronJob's is generated. Pass the pod's name through the
     /// downward API (`fieldRef: metadata.name`).
-    #[arg(long, conflicts_with = "owner_job_name")]
+    #[arg(long)]
     owner_job_from_pod: Option<String>,
+
+    /// Exit without dispatching while another run of this name prefix is still
+    /// working, instead of taking its Jobs over as an earlier run's leftovers.
+    #[arg(long, requires = "owner")]
+    yield_to_live_run: bool,
 
     /// Prefix for the labels stamped on created Jobs (`<prefix>/owner`,
     /// `<prefix>/node`, `<prefix>/node-name`). Two dispatchers sharing a namespace
@@ -246,6 +252,32 @@ async fn main() -> Result<()> {
         None => None,
     };
 
+    let owner = match (
+        args.owner_job_name.as_deref(),
+        args.owner_job_from_pod.as_deref(),
+    ) {
+        (Some(name), _) => Some(owner_ref_for_job(&client, &namespace, name).await?),
+        (None, Some(pod)) => Some(owner_ref_from_pod(&client, &namespace, pod).await?),
+        (None, None) => None,
+    };
+
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &namespace);
+
+    // Asked before the nodes are resolved: a run that is about to stand aside would
+    // otherwise wait out --wait-for-nodes-secs to then dispatch to none of them.
+    if let Some(owner) = owner.as_ref().filter(|_| args.yield_to_live_run) {
+        let owner_value = sanitize_label_value(&args.name_prefix);
+        if let Some(holder) =
+            live_run_holding_the_fleet(&jobs, &owner_value, owner, &tracking).await?
+        {
+            info!(
+                "the Job {holder} is still running per-node Jobs of its own; leaving the fleet to \
+                 it and dispatching nothing"
+            );
+            return Ok(());
+        }
+    }
+
     let admission = template_admission(&template);
     let mut nodes = resolve_nodes(&client, &args, &admission).await?;
     // The matched set, not the admitted one: this decides which nodes the
@@ -259,17 +291,6 @@ async fn main() -> Result<()> {
         let (matched, _, _) = select_nodes(&api, &args, &admission).await?;
         matched
     };
-
-    let owner = match (
-        args.owner_job_name.as_deref(),
-        args.owner_job_from_pod.as_deref(),
-    ) {
-        (Some(name), _) => Some(owner_ref_for_job(&client, &namespace, name).await?),
-        (None, Some(pod)) => Some(owner_ref_from_pod(&client, &namespace, pod).await?),
-        (None, None) => None,
-    };
-
-    let jobs: Api<Job> = Api::namespaced(client.clone(), &namespace);
 
     if let Some((cleanup_path, ownership_key)) = cleanup {
         nodes = converge_removed_nodes(
@@ -891,6 +912,16 @@ async fn owner_ref_from_pod(
     owning_job_of_pod(&pod, pod_name)
 }
 
+/// The kind alone is not enough: another API group is free to have a Job of its own.
+fn references_a_batch_job(reference: &OwnerReference) -> bool {
+    reference.kind == "Job"
+        && reference
+            .api_version
+            .split('/')
+            .next()
+            .is_some_and(|group| group == "batch")
+}
+
 /// Read off the pod rather than by fetching the Job: the uid there was written by
 /// the Job controller, so there is nothing a GET could confirm about it.
 fn owning_job_of_pod(pod: &Pod, pod_name: &str) -> Result<OwnerReference> {
@@ -898,14 +929,7 @@ fn owning_job_of_pod(pod: &Pod, pod_name: &str) -> Result<OwnerReference> {
         .owner_references
         .iter()
         .flatten()
-        .find(|reference| {
-            reference.kind == "Job"
-                && reference
-                    .api_version
-                    .split('/')
-                    .next()
-                    .is_some_and(|group| group == "batch")
-        })
+        .find(|reference| references_a_batch_job(reference))
         .map(|reference| OwnerReference {
             api_version: reference.api_version.clone(),
             kind: reference.kind.clone(),
@@ -1245,6 +1269,77 @@ async fn run_fanout(
 
     info!("all {succeeded} node(s) completed successfully");
     Ok(())
+}
+
+/// The Job driving another run of this name prefix, if one is still working.
+///
+/// The sweep below deletes a Job owned by anyone but us as an earlier run's
+/// leftover, which is right once that run has ended and wrong while it has not:
+/// two live runs would delete each other's privileged pods mid-work. Only an
+/// unfinished owner counts, since leftovers are what the sweep is for.
+async fn live_run_holding_the_fleet(
+    jobs: &Api<Job>,
+    owner_value: &str,
+    owner: &OwnerReference,
+    tracking: &TrackingLabels,
+) -> Result<Option<String>> {
+    let selector = format!("{}={}", tracking.owner, owner_value);
+    let mut token: Option<String> = None;
+    let mut asked: HashSet<String> = HashSet::new();
+    loop {
+        let mut params = ListParams::default().labels(&selector).limit(500);
+        if let Some(value) = token.as_deref() {
+            params = params.continue_token(value);
+        }
+        let page = jobs.list(&params).await.with_context(|| {
+            format!("failed to list the per-node Jobs owned by {owner_value} to see who holds them")
+        })?;
+
+        for job in &page.items {
+            let Some(other) = foreign_owner_of(job, owner) else {
+                continue;
+            };
+            if !asked.insert(other.uid.clone()) {
+                continue;
+            }
+            match jobs.get(&other.name).await {
+                // Gone, so whatever it left is the sweep's to take.
+                Err(kube::Error::Api(status)) if status.code == 404 => (),
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "failed to read the Job {} that owns per-node Jobs of this name \
+                             prefix; without knowing whether it is still running, this run can \
+                             neither take them over nor stand aside",
+                            other.name
+                        )
+                    })
+                }
+                // The name was reused by a later Job, so this says nothing about the
+                // run being asked about.
+                Ok(found) if found.metadata.uid.as_deref() != Some(other.uid.as_str()) => (),
+                Ok(found) if interpret_status(&found) == JobOutcome::Running => {
+                    return Ok(Some(other.name))
+                }
+                Ok(_) => (),
+            }
+        }
+
+        token = page.metadata.continue_;
+        if token.as_deref().is_none_or(str::is_empty) {
+            return Ok(None);
+        }
+    }
+}
+
+/// An orphan yields `None`: there is no run behind it to stand aside for.
+fn foreign_owner_of(job: &Job, ours: &OwnerReference) -> Option<OwnerReference> {
+    job.metadata
+        .owner_references
+        .iter()
+        .flatten()
+        .find(|reference| references_a_batch_job(reference) && reference.uid != ours.uid)
+        .cloned()
 }
 
 /// Delete the Jobs an earlier run left behind, before any slot is opened. Their
@@ -1669,6 +1764,65 @@ mod tests {
             owning_job_of_pod(&pod, "some-pod").unwrap().name,
             "rollout-reconcile-29283840"
         );
+    }
+
+    #[test]
+    fn a_job_this_run_owns_has_no_other_run_behind_it() {
+        let ours = owner("uid-1");
+        assert_eq!(
+            foreign_owner_of(&existing_job("rollout-install", Some(&ours)), &ours),
+            None
+        );
+    }
+
+    #[test]
+    fn a_job_owned_by_another_run_names_it() {
+        let theirs = OwnerReference {
+            name: "rollout-install-dispatcher".to_string(),
+            ..owner("uid-theirs")
+        };
+        let found = foreign_owner_of(
+            &existing_job("rollout-install", Some(&theirs)),
+            &owner("uid-ours"),
+        );
+
+        assert_eq!(
+            found.map(|reference| reference.name).as_deref(),
+            Some("rollout-install-dispatcher")
+        );
+    }
+
+    #[test]
+    fn a_job_with_nobody_behind_it_is_the_sweeps_to_take() {
+        let outsider = OwnerReference {
+            api_version: "example.com/v1".to_string(),
+            ..owner("uid-theirs")
+        };
+        for job in [
+            existing_job("rollout-install", None),
+            existing_job("rollout-install", Some(&outsider)),
+        ] {
+            assert_eq!(foreign_owner_of(&job, &owner("uid-ours")), None);
+        }
+    }
+
+    #[test]
+    fn yielding_needs_an_owner_to_compare_against() {
+        let base = [
+            "k8s-job-dispatcher",
+            "--job-template=/etc/job/install-job.yaml",
+            "--name-prefix=rollout-install",
+            "--yield-to-live-run",
+        ];
+        assert!(Args::try_parse_from(base).is_err());
+
+        let mut named = base.to_vec();
+        named.push("--owner-job-name=rollout-install-dispatcher");
+        assert!(Args::try_parse_from(named).is_ok());
+
+        let mut from_pod = base.to_vec();
+        from_pod.push("--owner-job-from-pod=rollout-reconcile-29283840-abcde");
+        assert!(Args::try_parse_from(from_pod).is_ok());
     }
 
     #[test]

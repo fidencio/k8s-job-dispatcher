@@ -155,7 +155,8 @@ rules:
 ```
 
 `get` on nodes is needed by the pre-dispatch revalidation, and `list` on Jobs by
-the stale-Job cleanup; the status polling itself only uses `get`.
+the stale-Job cleanup and by `--yield-to-live-run`; the status polling itself only
+uses `get`.
 
 `nodes: ["patch"]` is additionally needed for any of the node-label flags or
 `--remove-node-taints`, and `nodes/proxy: ["get"]` for
@@ -199,6 +200,7 @@ settle.
 | `--poll-interval-secs` | `5` | Seconds between status polls |
 | `--owner-job-name` | — | Adds an `ownerReference` to this Job, so the per-node Jobs are garbage-collected with it |
 | `--owner-job-from-pod` | — | Same, for a run that cannot name its own Job: the owner is the Job that created this pod |
+| `--yield-to-live-run` | `false` | Exit without dispatching while another run of this name prefix is still working. Needs an owner |
 | `--tracking-label-prefix` | `k8s-job-dispatcher` | Prefix for `<prefix>/owner`, `<prefix>/node` and `<prefix>/node-name` |
 | `--cleanup-job-template` | — | Job template for nodes this instance owns but no longer selects (below) |
 | `--require-node-runtime-version` | `false` | Fail a node that reports no `containerRuntimeVersion` instead of dispatching to it |
@@ -232,6 +234,18 @@ That pod has to be in the namespace the per-node Jobs are created in. Kubernetes
 does not honour an `ownerReference` pointing into another namespace: it reads the
 dependent as having no owner left and deletes it, which is the opposite of what
 asking for an owner was for.
+
+`--yield-to-live-run` covers the case where two runs of the same name prefix
+overlap — an upgrade landing while something scheduled is mid-rollout, or two
+people upgrading at once. Without it the second run reads the first one's
+per-node Jobs as an earlier run's leftovers and deletes them, taking down
+privileged pods in the middle of their work. With it, the second run finds the
+Job driving them, sees it is still running, says whose fleet it is and exits 0.
+
+It is off by default because standing aside is only free for a run that repeats.
+An owning Job that is suspended, or whose pod cannot be scheduled, looks busy for
+as long as it exists, and a one-shot run that yields to it has simply not
+happened.
 
 Generated Job names are DNS-1123-safe and collision-free: a name is used verbatim
 only when sanitizing changed nothing and it fits in 63 characters, and otherwise

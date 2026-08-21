@@ -365,6 +365,16 @@ an `ownerReference` across namespaces is not honoured and leaves the dependent
 looking unowned, which garbage-collects exactly what the reference was meant to
 protect.
 
+`Stale` is the right reading of a Job whose run has ended and the wrong one while
+it has not: two overlapping runs would each delete the other's per-node Jobs,
+tearing down privileged pods in the middle of the work they were started for.
+Which of the two it is, is a question about the owning Job, so
+`--yield-to-live-run` asks that Job — and where it is still running, this run logs
+whose fleet it is and exits without dispatching. It is the caller's choice
+because an owning Job that is suspended, or whose pod never schedules, looks
+busy indefinitely, and a run that repeats is the only kind for which standing
+aside costs nothing.
+
 Recreation deletes in **foreground** so the Job outlives its pods rather than the
 other way round: two of those pods on one node would both do the same privileged
 work at the same time. Since deletion is asynchronous and the name is only free
@@ -562,8 +572,8 @@ features asked for.
 
 Nothing needs `watch`, because there is no informer. Nothing needs `list` on
 Jobs for the polling, because status is read with `GET` by name — `list` appears
-only for the stale-Job sweep, and a deployment that names no owner does not sweep
-and does not need it. `patch` on nodes appears only with the label and taint
+only for the stale-Job sweep and for `--yield-to-live-run`, and a deployment that
+names no owner does neither and needs neither. `patch` on nodes appears only with the label and taint
 flags, `nodes/proxy` only with the advisory kubelet timeout check, and `get` on
 pods only when the owner is derived from one.
 
@@ -583,7 +593,9 @@ Two instances of the same configuration running at once are not coordinated by
 leases — they are made safe by the ownership arithmetic and the guarded writes
 described above. That is a weaker guarantee than mutual exclusion and an
 intentional trade: the alternative is a component that must be highly available
-to make progress at all.
+to make progress at all. `--yield-to-live-run` is not that guarantee either: a
+run that sees another one's Jobs stands aside, and two runs starting close enough
+together that neither sees the other's still fall back on the same arithmetic.
 
 Consequently, an operator wanting steady-state enforcement should run this on a
 schedule or as an upgrade hook, and read a non-zero exit as the signal it is.
