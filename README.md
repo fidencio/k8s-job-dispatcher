@@ -160,7 +160,8 @@ the stale-Job cleanup; the status polling itself only uses `get`.
 `nodes: ["patch"]` is additionally needed for any of the node-label flags or
 `--remove-node-taints`, and `nodes/proxy: ["get"]` for
 `--kubelet-timeout-warn-secs`. `--owner-job-name` needs `get` on the owning Job,
-which the rule above already covers.
+which the rule above already covers, while `--owner-job-from-pod` needs
+`pods: ["get"]` to read the pod's own `ownerReferences`.
 
 ## Options
 
@@ -197,6 +198,7 @@ settle.
 | `--parallelism` | `100` | Maximum Jobs in flight |
 | `--poll-interval-secs` | `5` | Seconds between status polls |
 | `--owner-job-name` | — | Adds an `ownerReference` to this Job, so the per-node Jobs are garbage-collected with it |
+| `--owner-job-from-pod` | — | Same, for a run that cannot name its own Job: the owner is the Job that created this pod |
 | `--tracking-label-prefix` | `k8s-job-dispatcher` | Prefix for `<prefix>/owner`, `<prefix>/node` and `<prefix>/node-name` |
 | `--cleanup-job-template` | — | Job template for nodes this instance owns but no longer selects (below) |
 | `--require-node-runtime-version` | `false` | Fail a node that reports no `containerRuntimeVersion` instead of dispatching to it |
@@ -212,6 +214,24 @@ certain to fail immediately.
 
 Give two dispatchers sharing a namespace different `--tracking-label-prefix`
 values and neither will mistake the other's Jobs for its own.
+
+A CronJob's Job is called `<cronjob>-<timestamp>`, a name nothing can put in the
+manifest that starts it, so a run like that names its pod instead and the owning
+Job is resolved from there:
+
+```yaml
+args: ["--owner-job-from-pod=$(POD_NAME)"]
+env:
+  - name: POD_NAME
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.name
+```
+
+That pod has to be in the namespace the per-node Jobs are created in. Kubernetes
+does not honour an `ownerReference` pointing into another namespace: it reads the
+dependent as having no owner left and deletes it, which is the opposite of what
+asking for an owner was for.
 
 Generated Job names are DNS-1123-safe and collision-free: a name is used verbatim
 only when sanitizing changed nothing and it fits in 63 characters, and otherwise

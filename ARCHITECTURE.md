@@ -354,9 +354,16 @@ An `ownerReference` to *this* dispatcher's Job can, and that is what
 | `Current` | Owner label matches and our owner UID is referenced | Adopt and poll it |
 | `Stale` | Owner label matches, our owner UID is not referenced | Delete and recreate |
 
-Without `--owner-job-name` there is nothing to compare against, so a labelled Job
-is taken as current and the stale-Job sweep is skipped entirely rather than
-guessing.
+Without an owner there is nothing to compare against, so a labelled Job is taken
+as current and the stale-Job sweep is skipped entirely rather than guessing.
+
+A run whose own Job is named for it — a CronJob's `<name>-<timestamp>` — cannot
+put that name in the manifest that starts it, so `--owner-job-from-pod` derives
+the owner from the pod instead: the Job controller already recorded which Job
+created it. The pod is read from the namespace the per-node Jobs go into, because
+an `ownerReference` across namespaces is not honoured and leaves the dependent
+looking unowned, which garbage-collects exactly what the reference was meant to
+protect.
 
 Recreation deletes in **foreground** so the Job outlives its pods rather than the
 other way round: two of those pods on one node would both do the same privileged
@@ -555,10 +562,10 @@ features asked for.
 
 Nothing needs `watch`, because there is no informer. Nothing needs `list` on
 Jobs for the polling, because status is read with `GET` by name — `list` appears
-only for the stale-Job sweep, and a deployment that passes no
-`--owner-job-name` does not sweep and does not need it. `patch` on nodes appears
-only with the label and taint flags, and `nodes/proxy` only with the advisory
-kubelet timeout check.
+only for the stale-Job sweep, and a deployment that names no owner does not sweep
+and does not need it. `patch` on nodes appears only with the label and taint
+flags, `nodes/proxy` only with the advisory kubelet timeout check, and `get` on
+pods only when the owner is derived from one.
 
 The privilege that is *not* on this list is the interesting one: the per-node
 Jobs, which are the privileged half of the operation, hold no credentials at

@@ -21,7 +21,7 @@ use job::{
     TrackingLabels, DEFAULT_TRACKING_LABEL_PREFIX,
 };
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::Node;
+use k8s_openapi::api::core::v1::{Node, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{Api, DeleteParams, ListParams, PostParams};
 use kube::Client;
@@ -115,6 +115,12 @@ struct Args {
     /// garbage-collected together with it.
     #[arg(long)]
     owner_job_name: Option<String>,
+
+    /// Same owner, taken from the Job that created this pod, for a run that cannot
+    /// name its own Job: a CronJob's is generated. Pass the pod's name through the
+    /// downward API (`fieldRef: metadata.name`).
+    #[arg(long, conflicts_with = "owner_job_name")]
+    owner_job_from_pod: Option<String>,
 
     /// Prefix for the labels stamped on created Jobs (`<prefix>/owner`,
     /// `<prefix>/node`, `<prefix>/node-name`). Two dispatchers sharing a namespace
@@ -254,9 +260,13 @@ async fn main() -> Result<()> {
         matched
     };
 
-    let owner = match args.owner_job_name.as_deref() {
-        Some(name) => Some(owner_ref_for_job(&client, &namespace, name).await?),
-        None => None,
+    let owner = match (
+        args.owner_job_name.as_deref(),
+        args.owner_job_from_pod.as_deref(),
+    ) {
+        (Some(name), _) => Some(owner_ref_for_job(&client, &namespace, name).await?),
+        (None, Some(pod)) => Some(owner_ref_from_pod(&client, &namespace, pod).await?),
+        (None, None) => None,
     };
 
     let jobs: Api<Job> = Api::namespaced(client.clone(), &namespace);
@@ -863,6 +873,55 @@ async fn owner_ref_for_job(client: &Client, namespace: &str, name: &str) -> Resu
         controller: Some(false),
         block_owner_deletion: Some(false),
     })
+}
+
+/// The pod is looked up in the namespace the per-node Jobs go into: Kubernetes does
+/// not honour an `ownerReference` across namespaces, and deletes the dependent as
+/// unowned instead.
+async fn owner_ref_from_pod(
+    client: &Client,
+    namespace: &str,
+    pod_name: &str,
+) -> Result<OwnerReference> {
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let pod = pods
+        .get(pod_name)
+        .await
+        .with_context(|| format!("failed to get pod {pod_name} in namespace {namespace}"))?;
+    owning_job_of_pod(&pod, pod_name)
+}
+
+/// Read off the pod rather than by fetching the Job: the uid there was written by
+/// the Job controller, so there is nothing a GET could confirm about it.
+fn owning_job_of_pod(pod: &Pod, pod_name: &str) -> Result<OwnerReference> {
+    pod.metadata
+        .owner_references
+        .iter()
+        .flatten()
+        .find(|reference| {
+            reference.kind == "Job"
+                && reference
+                    .api_version
+                    .split('/')
+                    .next()
+                    .is_some_and(|group| group == "batch")
+        })
+        .map(|reference| OwnerReference {
+            api_version: reference.api_version.clone(),
+            kind: reference.kind.clone(),
+            name: reference.name.clone(),
+            uid: reference.uid.clone(),
+            controller: Some(false),
+            block_owner_deletion: Some(false),
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "pod {pod_name} is not owned by a Job, so there is nothing for the per-node Jobs \
+                 to be garbage-collected with. --owner-job-from-pod is for a dispatcher running as \
+                 a Job it cannot name, such as a CronJob's; anything else should either name its \
+                 Job with --owner-job-name or pass neither"
+            )
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1551,6 +1610,77 @@ mod tests {
             disposition_of(&existing, "rollout-install", None),
             Disposition::Current
         );
+    }
+
+    fn pod_owned_by(references: &[OwnerReference]) -> Pod {
+        Pod {
+            metadata: ObjectMeta {
+                name: Some("rollout-reconcile-29283840-abcde".to_string()),
+                owner_references: Some(references.to_vec()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn controller(kind: &str, api_version: &str) -> OwnerReference {
+        OwnerReference {
+            uid: "uid-of-the-run".to_string(),
+            name: "rollout-reconcile-29283840".to_string(),
+            kind: kind.to_string(),
+            api_version: api_version.to_string(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        }
+    }
+
+    #[test]
+    fn the_job_that_created_the_pod_becomes_the_owner() {
+        let pod = pod_owned_by(&[controller("Job", "batch/v1")]);
+        let owner = owning_job_of_pod(&pod, "rollout-reconcile-29283840-abcde").unwrap();
+
+        assert_eq!(owner.name, "rollout-reconcile-29283840");
+        assert_eq!(owner.uid, "uid-of-the-run");
+        // Never a controller reference, whatever the pod's own says.
+        assert_eq!(owner.controller, Some(false));
+        assert_eq!(owner.block_owner_deletion, Some(false));
+    }
+
+    #[test]
+    fn a_pod_no_job_created_has_no_owner_to_offer() {
+        for pod in [
+            pod_owned_by(&[]),
+            pod_owned_by(&[controller("ReplicaSet", "apps/v1")]),
+            pod_owned_by(&[controller("Job", "example.com/v1")]),
+            Pod::default(),
+        ] {
+            assert!(owning_job_of_pod(&pod, "some-pod").is_err());
+        }
+    }
+
+    #[test]
+    fn the_owning_job_is_found_among_other_references() {
+        let pod = pod_owned_by(&[
+            controller("ReplicaSet", "apps/v1"),
+            controller("Job", "batch/v1"),
+        ]);
+
+        assert_eq!(
+            owning_job_of_pod(&pod, "some-pod").unwrap().name,
+            "rollout-reconcile-29283840"
+        );
+    }
+
+    #[test]
+    fn the_owner_job_is_either_named_or_taken_from_a_pod() {
+        assert!(Args::try_parse_from([
+            "k8s-job-dispatcher",
+            "--job-template=/etc/job/install-job.yaml",
+            "--name-prefix=rollout-install",
+            "--owner-job-name=rollout-install-dispatcher",
+            "--owner-job-from-pod=rollout-reconcile-29283840-abcde",
+        ])
+        .is_err());
     }
 
     fn job_with_pod_spec(spec: Option<PodSpec>) -> Job {
