@@ -176,6 +176,7 @@ which the rule above already covers, while `--owner-job-from-pod` needs
 | `--ignore-node-taints` | `false` | Target matched nodes even when the template does not tolerate their taints — for cleanup runs that must reach nodes tainted since |
 | `--wait-for-nodes-secs` | `0` | Keep re-resolving while nothing is eligible. Also declares that nodes are expected, making an empty selection an error rather than a silent no-op |
 | `--node-settle-secs` | `15` | How long the eligible set must stay unchanged before it is accepted |
+| `--skip-satisfied-nodes` | `false` | Leave out nodes that already carry `--node-label` at its finished value and serve `--require-node-handlers` |
 | `--node-page-size` | `500` | `LIST` page size |
 
 `--wait-for-nodes-secs` exists because the dispatcher runs once while a DaemonSet
@@ -188,6 +189,21 @@ landed in the last few seconds. Waiting for a quiet period instead stops a rollo
 from starting on whichever node won the race and leaving the rest out. It only
 applies while `--wait-for-nodes-secs` is set; without a wait there is nothing to
 settle.
+
+`--skip-satisfied-nodes` is for a run that repeats in order to *cover* nodes that
+joined since, rather than to roll a change out. It leaves alone any node where
+every label this instance writes already holds the finished value and, where
+`--require-node-handlers` is set, whose runtime says it is serving one of them —
+so a run with nothing to do is one `LIST` and no Jobs at all, instead of a pod per
+node discovering that its work is done. A node at the pending value is never
+skipped: it was claimed by a run that did not see it through, and finishing it is
+the most useful thing a later run can do.
+
+The handlers half is what catches a host rebuilt under a Node object that kept its
+labels. What nothing here catches is a *new version* of what the Jobs install,
+because the label records that a run finished and not which one. Skipping is
+coverage, never a rollout: the run that upgrades a fleet is the one that does not
+pass this flag.
 
 ### Dispatching
 

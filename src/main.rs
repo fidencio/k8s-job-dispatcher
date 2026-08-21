@@ -128,6 +128,12 @@ struct Args {
     #[arg(long, requires = "owner")]
     yield_to_live_run: bool,
 
+    /// Dispatch only to nodes that do not already carry --node-label at its
+    /// finished value and serve --require-node-handlers. Covers nodes that joined
+    /// since; does not roll a change out.
+    #[arg(long, requires = "node_label")]
+    skip_satisfied_nodes: bool,
+
     /// Prefix for the labels stamped on created Jobs (`<prefix>/owner`,
     /// `<prefix>/node`, `<prefix>/node-name`). Two dispatchers sharing a namespace
     /// need different prefixes to not read each other's Jobs.
@@ -313,6 +319,24 @@ async fn main() -> Result<()> {
     if nodes.is_empty() {
         info!("no target nodes matched the selection; nothing to do");
         return Ok(());
+    }
+
+    // Only the dispatch pass skips. The cleanup pass above acts on nodes that left
+    // the selection, and one of those needs taking apart however finished it looks.
+    if args.skip_satisfied_nodes {
+        let selected = nodes.len();
+        nodes.retain(|node| !node_ops.is_satisfied(node));
+        if nodes.is_empty() {
+            info!("all {selected} selected node(s) already carry this run's result; nothing to do");
+            return Ok(());
+        }
+        if nodes.len() < selected {
+            info!(
+                "{} of {selected} selected node(s) already carry this run's result and are left \
+                 alone",
+                selected - nodes.len()
+            );
+        }
     }
 
     let parallelism = args.parallelism.clamp(1, nodes.len());
@@ -1823,6 +1847,21 @@ mod tests {
         let mut from_pod = base.to_vec();
         from_pod.push("--owner-job-from-pod=rollout-reconcile-29283840-abcde");
         assert!(Args::try_parse_from(from_pod).is_ok());
+    }
+
+    #[test]
+    fn skipping_satisfied_nodes_needs_the_label_that_says_so() {
+        let base = [
+            "k8s-job-dispatcher",
+            "--job-template=/etc/job/install-job.yaml",
+            "--name-prefix=rollout-install",
+            "--skip-satisfied-nodes",
+        ];
+        assert!(Args::try_parse_from(base).is_err());
+
+        let mut labelled = base.to_vec();
+        labelled.extend(["--node-label-key=example.com/ready", "--node-label=true"]);
+        assert!(Args::try_parse_from(labelled).is_ok());
     }
 
     #[test]

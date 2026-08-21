@@ -196,6 +196,22 @@ impl NodeOps {
         }
     }
 
+    /// Whether a finished run already shows on this node.
+    ///
+    /// The pending value does not count: a claimed node is one an earlier run did
+    /// not see through. Labels alone would, though, so the handlers the node
+    /// reports are read too - that is what catches a host rebuilt under a Node
+    /// object that kept its labels. A node reporting none was labelled without that
+    /// proof either, and failing it here would dispatch to it for ever.
+    pub fn is_satisfied(&self, node: &Node) -> bool {
+        node_is_satisfied(
+            self.labelling.as_ref(),
+            self.label_value.as_deref(),
+            &self.require_handlers,
+            node,
+        )
+    }
+
     pub async fn get(&self, node: &str) -> Result<Node> {
         self.api
             .get(node)
@@ -900,6 +916,32 @@ fn is_precondition_failure(err: &kube::Error) -> bool {
 /// `None` only when the node does not report the field at all (below Kubernetes
 /// 1.30, or a kubelet that does not publish it). An empty list is an answer, and
 /// the answer is "nothing".
+fn node_is_satisfied(
+    labelling: Option<&NodeLabelling>,
+    finished: Option<&str>,
+    require_handlers: &[String],
+    node: &Node,
+) -> bool {
+    let (Some(labelling), Some(finished)) = (labelling, finished) else {
+        return false;
+    };
+
+    let labels = node.metadata.labels.as_ref();
+    let labelled = labelling.keys().into_iter().all(|key| {
+        labels
+            .and_then(|labels| labels.get(key))
+            .map(String::as_str)
+            == Some(finished)
+    });
+    if !labelled {
+        return false;
+    }
+
+    require_handlers.is_empty()
+        || handler_verdict(require_handlers, served_handlers(node).as_deref())
+            != HandlerVerdict::NotServing
+}
+
 fn served_handlers(node: &Node) -> Option<Vec<String>> {
     Some(
         node.status
@@ -1026,6 +1068,81 @@ mod tests {
 
     fn expected(handlers: &[&str]) -> Vec<String> {
         handlers.iter().map(|h| h.to_string()).collect()
+    }
+
+    fn node_labelled(labels: &[(&str, &str)], handlers: Option<&[&str]>) -> Node {
+        let mut node = match handlers {
+            Some(handlers) => node_serving(handlers),
+            None => Node::default(),
+        };
+        node.metadata.labels = Some(
+            labels
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        );
+        node
+    }
+
+    fn satisfied(node: &Node, require: &[&str]) -> bool {
+        node_is_satisfied(
+            Some(&labelling(None)),
+            Some("true"),
+            &expected(require),
+            node,
+        )
+    }
+
+    #[test]
+    fn a_node_showing_a_finished_run_is_satisfied() {
+        let node = node_labelled(
+            &[(SHARED_KEY, "true"), (&marker(None), "true")],
+            Some(&["special"]),
+        );
+
+        assert!(satisfied(&node, &["special"]));
+        assert!(satisfied(&node, &[]));
+    }
+
+    #[test]
+    fn a_claimed_or_unlabelled_node_is_not() {
+        let pending = DEFAULT_PENDING_LABEL_VALUE;
+        for labels in [
+            vec![],
+            vec![(SHARED_KEY, "true")],
+            vec![(SHARED_KEY, pending), (marker(None).as_str(), pending)],
+            // One instance is done here, this one has not started.
+            vec![(SHARED_KEY, "true"), ("deployer.example.com/other", "true")],
+        ] {
+            let node = node_labelled(&labels, Some(&["special"]));
+            assert!(!satisfied(&node, &["special"]), "{labels:?}");
+        }
+    }
+
+    #[test]
+    fn a_labelled_node_serving_nothing_is_not_satisfied() {
+        // A host rebuilt under a Node object that kept its labels.
+        let node = node_labelled(
+            &[(SHARED_KEY, "true"), (&marker(None), "true")],
+            Some(&["runc"]),
+        );
+
+        assert!(!satisfied(&node, &["special"]));
+    }
+
+    #[test]
+    fn a_node_that_cannot_answer_is_taken_at_its_label() {
+        let node = node_labelled(&[(SHARED_KEY, "true"), (&marker(None), "true")], None);
+
+        assert!(satisfied(&node, &["special"]));
+    }
+
+    #[test]
+    fn nothing_is_satisfied_without_a_label_to_read() {
+        let node = node_labelled(&[(SHARED_KEY, "true")], Some(&["special"]));
+
+        assert!(!node_is_satisfied(None, Some("true"), &[], &node));
+        assert!(!node_is_satisfied(Some(&labelling(None)), None, &[], &node));
     }
 
     #[test]

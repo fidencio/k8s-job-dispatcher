@@ -72,14 +72,17 @@ without a cluster, and the test suite exercises them directly.
 flowchart TD
     begin(["start"]) --> ns["resolve namespace<br>and read templates"]
     ns --> guard["validate flag combinations<br>*before touching anything*"]
-    guard --> select["select nodes:<br>union of label selectors"]
+    guard --> live{"--yield-to-live-run<br>and another run working?"}
+    live -- yes --> aside(["exit 0: the fleet<br>is somebody's already"])
+    live -- no --> select["select nodes:<br>union of label selectors"]
     select --> settle["wait for the eligible<br>set to settle"]
     settle --> admit["taint admission<br>against the template"]
     admit --> converge{"cleanup template<br>configured?"}
     converge -- yes --> removed["clean the nodes owned<br>but no longer selected"]
-    converge -- no --> stale
+    converge -- no --> skip
     removed --> reresolve["re-resolve the selection"]
-    reresolve --> stale["delete Jobs left by<br>an earlier run"]
+    reresolve --> skip["--skip-satisfied-nodes:<br>leave finished nodes alone"]
+    skip --> stale["delete Jobs left by<br>an earlier run"]
     stale --> fanout["fan out, refilling<br>up to --parallelism"]
     fanout --> revalidate["**revalidate the node**<br>UID, selection, taints, facts"]
     revalidate --> dispatch["claim / demote labels,<br>create the Job"]
@@ -161,6 +164,28 @@ an internal flag inverting one decision, described under
 Cleanup can take long enough for a removed node to re-enter the selection, so
 the selection is re-resolved afterwards and the dispatch pass runs against the
 fresh answer.
+
+### Nodes already showing a finished run
+
+A run that repeats to *cover* nodes that joined since — rather than to roll a
+change out — has nothing to do on a node where an earlier run finished. Without
+`--skip-satisfied-nodes` it still dispatches there, and the pacing is spent on
+Jobs whose stages find their work already done: on a large fleet, one pod and one
+image pull per node to learn nothing changed.
+
+Two kinds of evidence answer whether a node is done, and both are already in the
+node `LIST`. The labels are bookkeeping: every key this instance writes has to
+hold the finished value, which the pending one is not, since a claimed node is
+one an earlier run did not see through. `.status.runtimeHandlers` is different in
+kind — the node's own answer about what its runtime loaded — and it is what
+notices a host rebuilt under a Node object that kept its labels. A node that
+reports no handlers at all was labelled without that proof too, so demanding it
+here would send a Job to the same node for ever.
+
+What no label answers is whether the payload has *changed*: the value records
+that a run finished, not which one. Skipping is therefore for coverage, never for
+a rollout, and is off unless asked for — the run that upgrades a fleet is the one
+that does not pass it.
 
 ### Stale Jobs
 
