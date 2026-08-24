@@ -15,13 +15,13 @@ mod node_filter;
 mod nodes;
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use job::{
     build_node_job, interpret_status, job_name, job_owned_by, sanitize_label_value, JobOutcome,
     TrackingLabels, DEFAULT_TRACKING_LABEL_PREFIX,
 };
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::Node;
+use k8s_openapi::api::core::v1::{Node, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{Api, DeleteParams, ListParams, PostParams};
 use kube::Client;
@@ -48,7 +48,8 @@ const JOB_GET_TIMEOUT: Duration = Duration::from_secs(15);
 #[command(
     author,
     version,
-    about = "Run one node-pinned Job per selected node, paced and with guaranteed coverage."
+    about = "Run one node-pinned Job per selected node, paced and with guaranteed coverage.",
+    group(ArgGroup::new("owner").args(["owner_job_name", "owner_job_from_pod"]))
 )]
 struct Args {
     /// Path to a YAML file containing the batch/v1 Job to run on each node. It is
@@ -115,6 +116,23 @@ struct Args {
     /// garbage-collected together with it.
     #[arg(long)]
     owner_job_name: Option<String>,
+
+    /// Same owner, taken from the Job that created this pod, for a run that cannot
+    /// name its own Job: a CronJob's is generated. Pass the pod's name through the
+    /// downward API (`fieldRef: metadata.name`).
+    #[arg(long)]
+    owner_job_from_pod: Option<String>,
+
+    /// Exit without dispatching while another run of this name prefix is still
+    /// working, instead of taking its Jobs over as an earlier run's leftovers.
+    #[arg(long, requires = "owner")]
+    yield_to_live_run: bool,
+
+    /// Dispatch only to nodes that do not already carry --node-label at its
+    /// finished value and serve --require-node-handlers. Covers nodes that joined
+    /// since; does not roll a change out.
+    #[arg(long, requires = "node_label")]
+    skip_satisfied_nodes: bool,
 
     /// Prefix for the labels stamped on created Jobs (`<prefix>/owner`,
     /// `<prefix>/node`, `<prefix>/node-name`). Two dispatchers sharing a namespace
@@ -240,6 +258,32 @@ async fn main() -> Result<()> {
         None => None,
     };
 
+    let owner = match (
+        args.owner_job_name.as_deref(),
+        args.owner_job_from_pod.as_deref(),
+    ) {
+        (Some(name), _) => Some(owner_ref_for_job(&client, &namespace, name).await?),
+        (None, Some(pod)) => Some(owner_ref_from_pod(&client, &namespace, pod).await?),
+        (None, None) => None,
+    };
+
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &namespace);
+
+    // Asked before the nodes are resolved: a run that is about to stand aside would
+    // otherwise wait out --wait-for-nodes-secs to then dispatch to none of them.
+    if let Some(owner) = owner.as_ref().filter(|_| args.yield_to_live_run) {
+        let owner_value = sanitize_label_value(&args.name_prefix);
+        if let Some(holder) =
+            live_run_holding_the_fleet(&jobs, &owner_value, owner, &tracking).await?
+        {
+            info!(
+                "the Job {holder} is still running per-node Jobs of its own; leaving the fleet to \
+                 it and dispatching nothing"
+            );
+            return Ok(());
+        }
+    }
+
     let admission = template_admission(&template);
     let mut nodes = resolve_nodes(&client, &args, &admission).await?;
     // The matched set, not the admitted one: this decides which nodes the
@@ -253,13 +297,6 @@ async fn main() -> Result<()> {
         let (matched, _, _) = select_nodes(&api, &args, &admission).await?;
         matched
     };
-
-    let owner = match args.owner_job_name.as_deref() {
-        Some(name) => Some(owner_ref_for_job(&client, &namespace, name).await?),
-        None => None,
-    };
-
-    let jobs: Api<Job> = Api::namespaced(client.clone(), &namespace);
 
     if let Some((cleanup_path, ownership_key)) = cleanup {
         nodes = converge_removed_nodes(
@@ -282,6 +319,24 @@ async fn main() -> Result<()> {
     if nodes.is_empty() {
         info!("no target nodes matched the selection; nothing to do");
         return Ok(());
+    }
+
+    // Only the dispatch pass skips. The cleanup pass above acts on nodes that left
+    // the selection, and one of those needs taking apart however finished it looks.
+    if args.skip_satisfied_nodes {
+        let selected = nodes.len();
+        nodes.retain(|node| !node_ops.is_satisfied(node));
+        if nodes.is_empty() {
+            info!("all {selected} selected node(s) already carry this run's result; nothing to do");
+            return Ok(());
+        }
+        if nodes.len() < selected {
+            info!(
+                "{} of {selected} selected node(s) already carry this run's result and are left \
+                 alone",
+                selected - nodes.len()
+            );
+        }
     }
 
     let parallelism = args.parallelism.clamp(1, nodes.len());
@@ -720,10 +775,8 @@ fn dedup_by_name(nodes: Vec<Node>, keep: Option<&[String]>) -> Vec<Node> {
     unique
 }
 
-/// Nodes matched but none tolerated is almost always a forgotten toleration, so it
-/// fails with the fix. Nothing matched at all is only a no-op when the caller never
-/// asked us to wait: having waited means nodes were expected, and exiting 0 there
-/// would leave the whole fleet untouched with nothing to show for it.
+/// Nowhere to dispatch to only fails a run that waited, since it expected nodes.
+/// For a run that repeats, an untolerated taint is as likely a node on its way up.
 fn no_eligible_nodes(args: &Args, skipped: &[SkippedNode]) -> Result<Vec<Node>> {
     let waited = if args.wait_for_nodes_secs > 0 {
         format!(" after waiting {}s", args.wait_for_nodes_secs)
@@ -732,6 +785,17 @@ fn no_eligible_nodes(args: &Args, skipped: &[SkippedNode]) -> Result<Vec<Node>> 
     };
 
     if let Some(blocked) = skipped.first() {
+        if args.wait_for_nodes_secs == 0 {
+            info!(
+                "all {} selected node(s) carry a taint this run does not tolerate (node {} has \
+                 taint {}); nothing to do",
+                skipped.len(),
+                blocked.name,
+                describe_taint(&blocked.taint)
+            );
+            return Ok(Vec::new());
+        }
+
         bail!(
             "all {} selected node(s) carry a taint this run does not tolerate{}, so there is \
              nowhere to dispatch to. First blocker: node {} has taint {}. If you meant to target \
@@ -863,6 +927,58 @@ async fn owner_ref_for_job(client: &Client, namespace: &str, name: &str) -> Resu
         controller: Some(false),
         block_owner_deletion: Some(false),
     })
+}
+
+/// The pod is looked up in the namespace the per-node Jobs go into: Kubernetes does
+/// not honour an `ownerReference` across namespaces, and deletes the dependent as
+/// unowned instead.
+async fn owner_ref_from_pod(
+    client: &Client,
+    namespace: &str,
+    pod_name: &str,
+) -> Result<OwnerReference> {
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let pod = pods
+        .get(pod_name)
+        .await
+        .with_context(|| format!("failed to get pod {pod_name} in namespace {namespace}"))?;
+    owning_job_of_pod(&pod, pod_name)
+}
+
+/// The kind alone is not enough: another API group is free to have a Job of its own.
+fn references_a_batch_job(reference: &OwnerReference) -> bool {
+    reference.kind == "Job"
+        && reference
+            .api_version
+            .split('/')
+            .next()
+            .is_some_and(|group| group == "batch")
+}
+
+/// Read off the pod rather than by fetching the Job: the uid there was written by
+/// the Job controller, so there is nothing a GET could confirm about it.
+fn owning_job_of_pod(pod: &Pod, pod_name: &str) -> Result<OwnerReference> {
+    pod.metadata
+        .owner_references
+        .iter()
+        .flatten()
+        .find(|reference| references_a_batch_job(reference))
+        .map(|reference| OwnerReference {
+            api_version: reference.api_version.clone(),
+            kind: reference.kind.clone(),
+            name: reference.name.clone(),
+            uid: reference.uid.clone(),
+            controller: Some(false),
+            block_owner_deletion: Some(false),
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "pod {pod_name} is not owned by a Job, so there is nothing for the per-node Jobs \
+                 to be garbage-collected with. --owner-job-from-pod is for a dispatcher running as \
+                 a Job it cannot name, such as a CronJob's; anything else should either name its \
+                 Job with --owner-job-name or pass neither"
+            )
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1186,6 +1302,77 @@ async fn run_fanout(
 
     info!("all {succeeded} node(s) completed successfully");
     Ok(())
+}
+
+/// The Job driving another run of this name prefix, if one is still working.
+///
+/// The sweep below deletes a Job owned by anyone but us as an earlier run's
+/// leftover, which is right once that run has ended and wrong while it has not:
+/// two live runs would delete each other's privileged pods mid-work. Only an
+/// unfinished owner counts, since leftovers are what the sweep is for.
+async fn live_run_holding_the_fleet(
+    jobs: &Api<Job>,
+    owner_value: &str,
+    owner: &OwnerReference,
+    tracking: &TrackingLabels,
+) -> Result<Option<String>> {
+    let selector = format!("{}={}", tracking.owner, owner_value);
+    let mut token: Option<String> = None;
+    let mut asked: HashSet<String> = HashSet::new();
+    loop {
+        let mut params = ListParams::default().labels(&selector).limit(500);
+        if let Some(value) = token.as_deref() {
+            params = params.continue_token(value);
+        }
+        let page = jobs.list(&params).await.with_context(|| {
+            format!("failed to list the per-node Jobs owned by {owner_value} to see who holds them")
+        })?;
+
+        for job in &page.items {
+            let Some(other) = foreign_owner_of(job, owner) else {
+                continue;
+            };
+            if !asked.insert(other.uid.clone()) {
+                continue;
+            }
+            match jobs.get(&other.name).await {
+                // Gone, so whatever it left is the sweep's to take.
+                Err(kube::Error::Api(status)) if status.code == 404 => (),
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "failed to read the Job {} that owns per-node Jobs of this name \
+                             prefix; without knowing whether it is still running, this run can \
+                             neither take them over nor stand aside",
+                            other.name
+                        )
+                    })
+                }
+                // The name was reused by a later Job, so this says nothing about the
+                // run being asked about.
+                Ok(found) if found.metadata.uid.as_deref() != Some(other.uid.as_str()) => (),
+                Ok(found) if interpret_status(&found) == JobOutcome::Running => {
+                    return Ok(Some(other.name))
+                }
+                Ok(_) => (),
+            }
+        }
+
+        token = page.metadata.continue_;
+        if token.as_deref().is_none_or(str::is_empty) {
+            return Ok(None);
+        }
+    }
+}
+
+/// An orphan yields `None`: there is no run behind it to stand aside for.
+fn foreign_owner_of(job: &Job, ours: &OwnerReference) -> Option<OwnerReference> {
+    job.metadata
+        .owner_references
+        .iter()
+        .flatten()
+        .find(|reference| references_a_batch_job(reference) && reference.uid != ours.uid)
+        .cloned()
 }
 
 /// Delete the Jobs an earlier run left behind, before any slot is opened. Their
@@ -1553,6 +1740,151 @@ mod tests {
         );
     }
 
+    fn pod_owned_by(references: &[OwnerReference]) -> Pod {
+        Pod {
+            metadata: ObjectMeta {
+                name: Some("rollout-reconcile-29283840-abcde".to_string()),
+                owner_references: Some(references.to_vec()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn controller(kind: &str, api_version: &str) -> OwnerReference {
+        OwnerReference {
+            uid: "uid-of-the-run".to_string(),
+            name: "rollout-reconcile-29283840".to_string(),
+            kind: kind.to_string(),
+            api_version: api_version.to_string(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        }
+    }
+
+    #[test]
+    fn the_job_that_created_the_pod_becomes_the_owner() {
+        let pod = pod_owned_by(&[controller("Job", "batch/v1")]);
+        let owner = owning_job_of_pod(&pod, "rollout-reconcile-29283840-abcde").unwrap();
+
+        assert_eq!(owner.name, "rollout-reconcile-29283840");
+        assert_eq!(owner.uid, "uid-of-the-run");
+        // Never a controller reference, whatever the pod's own says.
+        assert_eq!(owner.controller, Some(false));
+        assert_eq!(owner.block_owner_deletion, Some(false));
+    }
+
+    #[test]
+    fn a_pod_no_job_created_has_no_owner_to_offer() {
+        for pod in [
+            pod_owned_by(&[]),
+            pod_owned_by(&[controller("ReplicaSet", "apps/v1")]),
+            pod_owned_by(&[controller("Job", "example.com/v1")]),
+            Pod::default(),
+        ] {
+            assert!(owning_job_of_pod(&pod, "some-pod").is_err());
+        }
+    }
+
+    #[test]
+    fn the_owning_job_is_found_among_other_references() {
+        let pod = pod_owned_by(&[
+            controller("ReplicaSet", "apps/v1"),
+            controller("Job", "batch/v1"),
+        ]);
+
+        assert_eq!(
+            owning_job_of_pod(&pod, "some-pod").unwrap().name,
+            "rollout-reconcile-29283840"
+        );
+    }
+
+    #[test]
+    fn a_job_this_run_owns_has_no_other_run_behind_it() {
+        let ours = owner("uid-1");
+        assert_eq!(
+            foreign_owner_of(&existing_job("rollout-install", Some(&ours)), &ours),
+            None
+        );
+    }
+
+    #[test]
+    fn a_job_owned_by_another_run_names_it() {
+        let theirs = OwnerReference {
+            name: "rollout-install-dispatcher".to_string(),
+            ..owner("uid-theirs")
+        };
+        let found = foreign_owner_of(
+            &existing_job("rollout-install", Some(&theirs)),
+            &owner("uid-ours"),
+        );
+
+        assert_eq!(
+            found.map(|reference| reference.name).as_deref(),
+            Some("rollout-install-dispatcher")
+        );
+    }
+
+    #[test]
+    fn a_job_with_nobody_behind_it_is_the_sweeps_to_take() {
+        let outsider = OwnerReference {
+            api_version: "example.com/v1".to_string(),
+            ..owner("uid-theirs")
+        };
+        for job in [
+            existing_job("rollout-install", None),
+            existing_job("rollout-install", Some(&outsider)),
+        ] {
+            assert_eq!(foreign_owner_of(&job, &owner("uid-ours")), None);
+        }
+    }
+
+    #[test]
+    fn yielding_needs_an_owner_to_compare_against() {
+        let base = [
+            "k8s-job-dispatcher",
+            "--job-template=/etc/job/install-job.yaml",
+            "--name-prefix=rollout-install",
+            "--yield-to-live-run",
+        ];
+        assert!(Args::try_parse_from(base).is_err());
+
+        let mut named = base.to_vec();
+        named.push("--owner-job-name=rollout-install-dispatcher");
+        assert!(Args::try_parse_from(named).is_ok());
+
+        let mut from_pod = base.to_vec();
+        from_pod.push("--owner-job-from-pod=rollout-reconcile-29283840-abcde");
+        assert!(Args::try_parse_from(from_pod).is_ok());
+    }
+
+    #[test]
+    fn skipping_satisfied_nodes_needs_the_label_that_says_so() {
+        let base = [
+            "k8s-job-dispatcher",
+            "--job-template=/etc/job/install-job.yaml",
+            "--name-prefix=rollout-install",
+            "--skip-satisfied-nodes",
+        ];
+        assert!(Args::try_parse_from(base).is_err());
+
+        let mut labelled = base.to_vec();
+        labelled.extend(["--node-label-key=example.com/ready", "--node-label=true"]);
+        assert!(Args::try_parse_from(labelled).is_ok());
+    }
+
+    #[test]
+    fn the_owner_job_is_either_named_or_taken_from_a_pod() {
+        assert!(Args::try_parse_from([
+            "k8s-job-dispatcher",
+            "--job-template=/etc/job/install-job.yaml",
+            "--name-prefix=rollout-install",
+            "--owner-job-name=rollout-install-dispatcher",
+            "--owner-job-from-pod=rollout-reconcile-29283840-abcde",
+        ])
+        .is_err());
+    }
+
     fn job_with_pod_spec(spec: Option<PodSpec>) -> Job {
         Job {
             spec: Some(JobSpec {
@@ -1695,8 +2027,16 @@ mod tests {
     }
 
     #[test]
+    fn nodes_matched_but_all_tainted_are_a_no_op_when_we_never_waited() {
+        let nodes = no_eligible_nodes(&args_from(&[]), &[skipped_node("cp-0")])
+            .expect("a repeating run leaves a node on its way up for its next pass");
+        assert!(nodes.is_empty());
+    }
+
+    #[test]
     fn nodes_matched_but_all_tainted_fail_with_the_missing_toleration() {
-        let err = no_eligible_nodes(&args_from(&[]), &[skipped_node("cp-0")])
+        let args = args_from(&["--wait-for-nodes-secs=120"]);
+        let err = no_eligible_nodes(&args, &[skipped_node("cp-0")])
             .expect_err("a fully tainted selection has nowhere to dispatch to");
         let msg = err.to_string();
 

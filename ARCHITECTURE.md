@@ -72,14 +72,17 @@ without a cluster, and the test suite exercises them directly.
 flowchart TD
     begin(["start"]) --> ns["resolve namespace<br>and read templates"]
     ns --> guard["validate flag combinations<br>*before touching anything*"]
-    guard --> select["select nodes:<br>union of label selectors"]
+    guard --> live{"--yield-to-live-run<br>and another run working?"}
+    live -- yes --> aside(["exit 0: the fleet<br>is somebody's already"])
+    live -- no --> select["select nodes:<br>union of label selectors"]
     select --> settle["wait for the eligible<br>set to settle"]
     settle --> admit["taint admission<br>against the template"]
     admit --> converge{"cleanup template<br>configured?"}
     converge -- yes --> removed["clean the nodes owned<br>but no longer selected"]
-    converge -- no --> stale
+    converge -- no --> skip
     removed --> reresolve["re-resolve the selection"]
-    reresolve --> stale["delete Jobs left by<br>an earlier run"]
+    reresolve --> skip["--skip-satisfied-nodes:<br>leave finished nodes alone"]
+    skip --> stale["delete Jobs left by<br>an earlier run"]
     stale --> fanout["fan out, refilling<br>up to --parallelism"]
     fanout --> revalidate["**revalidate the node**<br>UID, selection, taints, facts"]
     revalidate --> dispatch["claim / demote labels,<br>create the Job"]
@@ -122,8 +125,8 @@ The dispatcher runs once where a DaemonSet would run forever, and that
 difference shows up on a fresh cluster: the labels a selector matches are often
 written by an add-on such as node-feature-discovery that is itself still
 starting. `--wait-for-nodes-secs` keeps re-resolving while nothing is eligible,
-and also declares that nodes are *expected*, which turns an empty selection into
-an error rather than a silent success.
+and also declares that nodes are *expected*, which turns having nowhere to
+dispatch to into an error rather than a silent success.
 
 `--node-settle-secs` (default 15) is the other half of that, and the subtler
 one. Those labels arrive **one node at a time**, so a single poll returning a
@@ -161,6 +164,28 @@ an internal flag inverting one decision, described under
 Cleanup can take long enough for a removed node to re-enter the selection, so
 the selection is re-resolved afterwards and the dispatch pass runs against the
 fresh answer.
+
+### Nodes already showing a finished run
+
+A run that repeats to *cover* nodes that joined since — rather than to roll a
+change out — has nothing to do on a node where an earlier run finished. Without
+`--skip-satisfied-nodes` it still dispatches there, and the pacing is spent on
+Jobs whose stages find their work already done: on a large fleet, one pod and one
+image pull per node to learn nothing changed.
+
+Two kinds of evidence answer whether a node is done, and both are already in the
+node `LIST`. The labels are bookkeeping: every key this instance writes has to
+hold the finished value, which the pending one is not, since a claimed node is
+one an earlier run did not see through. `.status.runtimeHandlers` is different in
+kind — the node's own answer about what its runtime loaded — and it is what
+notices a host rebuilt under a Node object that kept its labels. A node that
+reports no handlers at all was labelled without that proof too, so demanding it
+here would send a Job to the same node for ever.
+
+What no label answers is whether the payload has *changed*: the value records
+that a run finished, not which one. Skipping is therefore for coverage, never for
+a rollout, and is off unless asked for — the run that upgrades a fleet is the one
+that does not pass it.
 
 ### Stale Jobs
 
@@ -354,9 +379,26 @@ An `ownerReference` to *this* dispatcher's Job can, and that is what
 | `Current` | Owner label matches and our owner UID is referenced | Adopt and poll it |
 | `Stale` | Owner label matches, our owner UID is not referenced | Delete and recreate |
 
-Without `--owner-job-name` there is nothing to compare against, so a labelled Job
-is taken as current and the stale-Job sweep is skipped entirely rather than
-guessing.
+Without an owner there is nothing to compare against, so a labelled Job is taken
+as current and the stale-Job sweep is skipped entirely rather than guessing.
+
+A run whose own Job is named for it — a CronJob's `<name>-<timestamp>` — cannot
+put that name in the manifest that starts it, so `--owner-job-from-pod` derives
+the owner from the pod instead: the Job controller already recorded which Job
+created it. The pod is read from the namespace the per-node Jobs go into, because
+an `ownerReference` across namespaces is not honoured and leaves the dependent
+looking unowned, which garbage-collects exactly what the reference was meant to
+protect.
+
+`Stale` is the right reading of a Job whose run has ended and the wrong one while
+it has not: two overlapping runs would each delete the other's per-node Jobs,
+tearing down privileged pods in the middle of the work they were started for.
+Which of the two it is, is a question about the owning Job, so
+`--yield-to-live-run` asks that Job — and where it is still running, this run logs
+whose fleet it is and exits without dispatching. It is the caller's choice
+because an owning Job that is suspended, or whose pod never schedules, looks
+busy indefinitely, and a run that repeats is the only kind for which standing
+aside costs nothing.
 
 Recreation deletes in **foreground** so the Job outlives its pods rather than the
 other way round: two of those pods on one node would both do the same privileged
@@ -481,9 +523,12 @@ one of them is enough, because a node only serves the handlers built for its
 architecture and demanding all of them would fail every mixed-architecture
 fleet.
 
-An empty selection is a no-op when nobody asked to wait, and an error when they
-did — having waited means nodes were expected, and exiting 0 there would leave a
-whole fleet untouched with nothing to show for it.
+Having nowhere to dispatch to is a no-op when nobody asked to wait, and an error
+when they did — having waited means nodes were expected, and exiting 0 there would
+leave a whole fleet untouched with nothing to show for it. Either way of having
+nowhere counts: nothing matched, and everything matched carrying a taint we do not
+tolerate. The second is a forgotten toleration for a run that expected nodes, and
+a node on its way up for one that repeats.
 
 ## Multi-Instance Ownership
 
@@ -555,10 +600,10 @@ features asked for.
 
 Nothing needs `watch`, because there is no informer. Nothing needs `list` on
 Jobs for the polling, because status is read with `GET` by name — `list` appears
-only for the stale-Job sweep, and a deployment that passes no
-`--owner-job-name` does not sweep and does not need it. `patch` on nodes appears
-only with the label and taint flags, and `nodes/proxy` only with the advisory
-kubelet timeout check.
+only for the stale-Job sweep and for `--yield-to-live-run`, and a deployment that
+names no owner does neither and needs neither. `patch` on nodes appears only with the label and taint
+flags, `nodes/proxy` only with the advisory kubelet timeout check, and `get` on
+pods only when the owner is derived from one.
 
 The privilege that is *not* on this list is the interesting one: the per-node
 Jobs, which are the privileged half of the operation, hold no credentials at
@@ -576,7 +621,13 @@ Two instances of the same configuration running at once are not coordinated by
 leases — they are made safe by the ownership arithmetic and the guarded writes
 described above. That is a weaker guarantee than mutual exclusion and an
 intentional trade: the alternative is a component that must be highly available
-to make progress at all.
+to make progress at all. `--yield-to-live-run` is not that guarantee either: a
+run that sees another one's Jobs stands aside, and two runs starting close enough
+together that neither sees the other's still fall back on the same arithmetic.
 
-Consequently, an operator wanting steady-state enforcement should run this on a
-schedule or as an upgrade hook, and read a non-zero exit as the signal it is.
+Consequently, reaching a node that appears later is a matter of running this
+again: as an upgrade hook for a change, or [on a
+schedule](README.md#running-on-a-schedule) for nodes that joined since. The
+second of those is coverage and not enforcement — a run can tell that no run has
+finished on a node, not that what finished is out of date — and either way a
+non-zero exit is the signal it is.
