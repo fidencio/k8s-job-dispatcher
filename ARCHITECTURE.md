@@ -125,8 +125,8 @@ The dispatcher runs once where a DaemonSet would run forever, and that
 difference shows up on a fresh cluster: the labels a selector matches are often
 written by an add-on such as node-feature-discovery that is itself still
 starting. `--wait-for-nodes-secs` keeps re-resolving while nothing is eligible,
-and also declares that nodes are *expected*, which turns an empty selection into
-an error rather than a silent success.
+and also declares that nodes are *expected*, which turns having nowhere to
+dispatch to into an error rather than a silent success.
 
 `--node-settle-secs` (default 15) is the other half of that, and the subtler
 one. Those labels arrive **one node at a time**, so a single poll returning a
@@ -523,9 +523,12 @@ one of them is enough, because a node only serves the handlers built for its
 architecture and demanding all of them would fail every mixed-architecture
 fleet.
 
-An empty selection is a no-op when nobody asked to wait, and an error when they
-did — having waited means nodes were expected, and exiting 0 there would leave a
-whole fleet untouched with nothing to show for it.
+Having nowhere to dispatch to is a no-op when nobody asked to wait, and an error
+when they did — having waited means nodes were expected, and exiting 0 there would
+leave a whole fleet untouched with nothing to show for it. Either way of having
+nowhere counts: nothing matched, and everything matched carrying a taint we do not
+tolerate. The second is a forgotten toleration for a run that expected nodes, and
+a node on its way up for one that repeats.
 
 ## Multi-Instance Ownership
 

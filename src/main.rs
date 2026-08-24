@@ -775,10 +775,8 @@ fn dedup_by_name(nodes: Vec<Node>, keep: Option<&[String]>) -> Vec<Node> {
     unique
 }
 
-/// Nodes matched but none tolerated is almost always a forgotten toleration, so it
-/// fails with the fix. Nothing matched at all is only a no-op when the caller never
-/// asked us to wait: having waited means nodes were expected, and exiting 0 there
-/// would leave the whole fleet untouched with nothing to show for it.
+/// Nowhere to dispatch to only fails a run that waited, since it expected nodes.
+/// For a run that repeats, an untolerated taint is as likely a node on its way up.
 fn no_eligible_nodes(args: &Args, skipped: &[SkippedNode]) -> Result<Vec<Node>> {
     let waited = if args.wait_for_nodes_secs > 0 {
         format!(" after waiting {}s", args.wait_for_nodes_secs)
@@ -787,6 +785,17 @@ fn no_eligible_nodes(args: &Args, skipped: &[SkippedNode]) -> Result<Vec<Node>> 
     };
 
     if let Some(blocked) = skipped.first() {
+        if args.wait_for_nodes_secs == 0 {
+            info!(
+                "all {} selected node(s) carry a taint this run does not tolerate (node {} has \
+                 taint {}); nothing to do",
+                skipped.len(),
+                blocked.name,
+                describe_taint(&blocked.taint)
+            );
+            return Ok(Vec::new());
+        }
+
         bail!(
             "all {} selected node(s) carry a taint this run does not tolerate{}, so there is \
              nowhere to dispatch to. First blocker: node {} has taint {}. If you meant to target \
@@ -2018,8 +2027,16 @@ mod tests {
     }
 
     #[test]
+    fn nodes_matched_but_all_tainted_are_a_no_op_when_we_never_waited() {
+        let nodes = no_eligible_nodes(&args_from(&[]), &[skipped_node("cp-0")])
+            .expect("a repeating run leaves a node on its way up for its next pass");
+        assert!(nodes.is_empty());
+    }
+
+    #[test]
     fn nodes_matched_but_all_tainted_fail_with_the_missing_toleration() {
-        let err = no_eligible_nodes(&args_from(&[]), &[skipped_node("cp-0")])
+        let args = args_from(&["--wait-for-nodes-secs=120"]);
+        let err = no_eligible_nodes(&args, &[skipped_node("cp-0")])
             .expect_err("a fully tainted selection has nowhere to dispatch to");
         let msg = err.to_string();
 

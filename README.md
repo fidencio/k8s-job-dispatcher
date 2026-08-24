@@ -174,7 +174,7 @@ which the rule above already covers, while `--owner-job-from-pod` needs
 | `--node-field-selector` | — | Field selector, AND-ed with the label selector |
 | `--nodes` | — | Explicit comma-separated node names; overrides the selectors and skips taint admission |
 | `--ignore-node-taints` | `false` | Target matched nodes even when the template does not tolerate their taints — for cleanup runs that must reach nodes tainted since |
-| `--wait-for-nodes-secs` | `0` | Keep re-resolving while nothing is eligible. Also declares that nodes are expected, making an empty selection an error rather than a silent no-op |
+| `--wait-for-nodes-secs` | `0` | Keep re-resolving while nothing is eligible. Also declares that nodes are expected, making having nowhere to dispatch to — nothing matched, or everything matched untolerated — an error rather than a silent no-op |
 | `--node-settle-secs` | `15` | How long the eligible set must stay unchanged before it is accepted |
 | `--skip-satisfied-nodes` | `false` | Leave out nodes that already carry `--node-label` at its finished value and serve `--require-node-handlers` |
 | `--node-page-size` | `500` | `LIST` page size |
@@ -390,8 +390,10 @@ spec:
 ```
 
 `--wait-for-nodes-secs=0` because that flag declares nodes are *expected* and
-makes an empty selection an error, which for something periodic should be a quiet
-no-op. It also switches off settling, so a run can catch a fleet mid-labelling and
+turns having nowhere to dispatch to into an error, which for something periodic
+should be a quiet no-op. That covers a node still carrying
+`node.kubernetes.io/not-ready` on its way in, which the next run finds ready. It
+also switches off settling, so a run can catch a fleet mid-labelling and
 dispatch to part of it — the rest arrive on the next one. Both are the opposite of
 what a one-shot run wants, so do not copy its values here.
 
