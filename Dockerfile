@@ -9,7 +9,7 @@
 
 # The only place the compiler is named: CI installs this same version, and
 # dependabot bumps it here. Not the MSRV, which is Cargo.toml's rust-version.
-FROM rust:1.97.1-trixie AS rust-base
+FROM rust:1.98.0-trixie AS rust-base
 
 # ring compiles C, and the cc crate wants musl-gcc once the target is musl.
 FROM rust-base AS musl-base
