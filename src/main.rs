@@ -553,7 +553,7 @@ fn check_taint_flags(args: &Args) -> Result<()> {
 fn node_ops_from_args(client: &Client, args: &Args) -> Result<NodeOps> {
     check_taint_flags(args)?;
 
-    let mut ops = NodeOps::new(client);
+    let mut ops = NodeOps::new(client, &args.tracking_label_prefix);
 
     ops.labelling = labelling_from_args(args)?;
     ops.label_value = args.node_label.clone();
@@ -998,12 +998,14 @@ struct NodeFailure {
 /// release timeout, its own node drained - would otherwise take the whole
 /// account with it.
 struct Outcomes {
+    ops: Arc<NodeOps>,
     reporter: Reporter,
 }
 
 impl Outcomes {
     async fn failed(&self, node: Option<&Node>, name: &str, reason: String) -> NodeFailure {
         error!("node {name}: {reason}");
+        self.ops.record_failure(name, uid_of(node), &reason).await;
         if let Some(node) = node {
             self.reporter.node_failed(node, &reason).await;
         }
@@ -1013,11 +1015,16 @@ impl Outcomes {
         }
     }
 
-    async fn succeeded(&self, node: Option<&Node>) {
+    async fn succeeded(&self, node: Option<&Node>, name: &str) {
+        self.ops.record_success(name, uid_of(node)).await;
         if let Some(node) = node {
             self.reporter.node_succeeded(node).await;
         }
     }
+}
+
+fn uid_of(node: Option<&Node>) -> Option<&str> {
+    node?.metadata.uid.as_deref()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1045,6 +1052,7 @@ async fn run_fanout(
         .filter_map(|node| Some((node.metadata.name.as_deref()?, node)))
         .collect();
     let outcomes = Outcomes {
+        ops: node_ops.clone(),
         reporter: Reporter::new(client, &args.tracking_label_prefix),
     };
 
@@ -1807,7 +1815,7 @@ async fn record_post_work(
         Ok(()) => {
             *succeeded += 1;
             info!("node {node}: done");
-            outcomes.succeeded(object).await;
+            outcomes.succeeded(object, &node).await;
         }
         Err(err) => {
             failed.push(
@@ -2305,6 +2313,14 @@ mod tests {
             labelling.instance.as_ref().map(InstanceMarker::key),
             Some("deployer.example.com/dev")
         );
+    }
+
+    #[test]
+    fn the_node_result_keys_follow_the_tracking_prefix() {
+        let args = args_from(&["--tracking-label-prefix=deployer.example.com"]);
+
+        let keys = nodes::ResultKeys::with_prefix(&args.tracking_label_prefix);
+        assert_eq!(keys.state, "deployer.example.com/result");
     }
 
     #[test]
