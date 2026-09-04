@@ -6,7 +6,7 @@ guaranteed per-node coverage.
 Give it any `batch/v1` Job manifest as a template and a way to select nodes. It
 creates one Job per node, pins each to its node with `spec.nodeName`, keeps at
 most `--parallelism` of them in flight at a time, and exits non-zero listing the
-nodes whose Jobs failed.
+nodes whose Jobs failed and what stopped each of them.
 
 This page is the reference for using it. [ARCHITECTURE.md](ARCHITECTURE.md) is
 the design: what guarantees it makes, and what it costs to bypass the scheduler
@@ -59,7 +59,10 @@ rollout — which is what makes it usable as a Helm hook or a CI gate.
     demoting labels beforehand; afterwards waiting for `Ready`, verifying CRI
     runtime handlers, applying labels until they stick, and lifting start-up
     taints.
-12. Exits 0 only when every node's Job *and* its post-success work succeeded.
+12. Reads the pod behind a Job that failed or stalled, so the reason travels with
+    the node's result instead of being left in a log that the Job's TTL deletes,
+    and records that result as an Event and on the Node itself.
+13. Exits 0 only when every node's Job *and* its post-success work succeeded.
 
 ### Node identity
 
@@ -150,27 +153,54 @@ and the tracking labels set. Everything else — containers, volumes, toleration
 
 ### RBAC
 
-Minimum, for the dispatch itself:
+The minimum any run needs:
 
 ```yaml
 rules:
   - apiGroups: [""]
     resources: ["nodes"]
-    verbs: ["get", "list"]
+    verbs: ["get", "list", "patch"]
   - apiGroups: ["batch"]
     resources: ["jobs"]
-    verbs: ["create", "get", "list", "delete"]
+    verbs: ["create", "get"]
 ```
 
-`get` on nodes is needed by the pre-dispatch revalidation, and `list` on Jobs by
-the stale-Job cleanup and by `--yield-to-live-run`; the status polling itself only
-uses `get`.
+`get` on nodes is needed by the pre-dispatch revalidation and `patch` by the
+result every run records on the node — which the node-label flags and
+`--remove-node-taints` then need nothing beyond. On Jobs, `create` fans out and
+`get` polls.
 
-`nodes: ["patch"]` is additionally needed for any of the node-label flags or
-`--remove-node-taints`, and `nodes/proxy: ["get"]` for
-`--kubelet-timeout-warn-secs`. `--owner-job-name` needs `get` on the owning Job,
-which the rule above already covers, while `--owner-job-from-pod` needs
+A run given an owner needs `jobs: ["list", "delete"]` on top of that: only an
+`ownerReference` tells this run's Jobs from an earlier run's, so a run without
+one leaves the leftovers alone rather than sweeping them, and cannot
+`--yield-to-live-run` either. `--owner-job-name` also needs `get` on the owning
+Job, which the rule above already covers, while `--owner-job-from-pod` needs
 `pods: ["get"]` to read the pod's own `ownerReferences`.
+
+`nodes/proxy: ["get"]` is additionally needed for
+`--kubelet-timeout-warn-secs`.
+
+Every run reports what became of each node, which means listing the pods a failed
+Job left behind and publishing the answer as an Event, so grant both:
+
+```yaml
+  # in --namespace
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+```
+
+```yaml
+  # in the default namespace, which is the only one the apiserver takes an Event
+  # about a Node in
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create"]
+```
+
+Neither is enforced — a run whose report is refused says so once and carries on,
+with the Job's own `Failed` condition as the only account of what happened. That
+is a rollout nobody can debug, though, which is why [reporting is not a flag](#reporting-what-happened).
 
 ## Options
 
@@ -359,6 +389,68 @@ instance's mark is left:
 
 Without `--instance-label-prefix` there is assumed to be a single instance, which
 owns the shared key outright.
+
+### Reporting what happened
+
+There is no flag in this section. A run says on stdout which nodes failed and
+what stopped each of them, and its final error repeats that list, but neither
+survives the run: the log goes with the dispatcher's pod, and the per-node Jobs
+go with their `ttlSecondsAfterFinished`, usually well before anybody looks. So
+every run also writes the same answer where it outlives all of that — as an
+Event against the Node, and on the Node itself.
+
+This is not configurable because a rollout that has to be asked to explain
+itself is one nobody asked, and the request would be missing from exactly the
+deployment that later needs the answer.
+
+The reason itself is read from the failed Job's **pod** while it is still there —
+the failing container, its exit code, and the termination message it left in
+`/dev/termination-log`:
+
+```text
+node worker-2: its job rollout-install-worker-2 failed: install-stage-host-check
+exited 1: this node has no usable virtualization backend [BackoffLimitExceeded]
+```
+
+A Job whose pod is not running gets the same treatment without waiting for it to
+fail. Nothing marks a Job that cannot schedule its pod or cannot pull its image,
+so it stays "running" until `activeDeadlineSeconds` turns it into a bare failure
+— an hour of a rollout looking busy on the usual settings. Two minutes in, and
+every five after that, the run says what the wait is for instead.
+
+**As an Event**, a `Normal`/`JobSucceeded` or `Warning`/`JobFailed` against the
+Node, plus `Warning`/`JobPending` for the stalls above. This is what `kubectl
+describe node` shows and what an event exporter already collects, so the result
+reaches existing tooling without it knowing anything about this dispatcher.
+
+The Event goes in the `default` namespace, not `--namespace`: a Node has no
+namespace of its own, and the apiserver rejects an Event whose `involvedObject`
+has none unless the Event itself is in `default`. That is also where the
+kubelet's own node events go, and it is where `events: ["create"]` has to be
+granted — the same verb in the run's own namespace grants nothing.
+
+**On the Node**, under `--tracking-label-prefix`:
+
+| Key | Kind | Value |
+| --- | --- | --- |
+| `<prefix>/result` | label | `succeeded` or `failed` |
+| `<prefix>/error` | annotation | why it failed; removed when it succeeds |
+| `<prefix>/finished-at` | annotation | when that was decided |
+
+The state is a label so a fleet can be searched by it — `kubectl get nodes -l
+<prefix>/result=failed` — and the reason is an annotation because it is a
+sentence, which is neither short enough nor punctuated simply enough for a label
+value. This is the durable half: the apiserver drops Events after its
+`--event-ttl` (an hour by default), while what is on the node stays until the
+next run overwrites it. It is written with `nodes: ["patch"]`, which every run
+therefore needs. A cleanup run (`--remove-node-label`) clears all three instead
+of writing `succeeded`, since the installation the result described is what it
+just took away.
+
+Both writes are best-effort: a result that could not be recorded is said once in
+the log and never turned into a second failure. A cluster that refuses them —
+an Event quota, a Role short a verb — gets a run that behaves exactly as it
+would have and an account of it that stops at the Job's `Failed` condition.
 
 ## Running on a schedule
 

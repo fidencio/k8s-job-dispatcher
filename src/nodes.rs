@@ -9,11 +9,14 @@
 
 use anyhow::{Context, Result};
 use k8s_openapi::api::core::v1::{Node, Taint};
+use k8s_openapi::chrono::{SecondsFormat, Utc};
 use kube::api::{Api, GetParams, Patch, PatchParams, Request};
 use kube::Client;
-use log::{info, warn};
+use log::{debug, info, warn};
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_PENDING_LABEL_VALUE: &str = "false";
@@ -35,6 +38,7 @@ const LABEL_APPLY_ATTEMPTS: u32 = 12;
 const TAINT_PATCH_ATTEMPTS: u32 = 3;
 const CLAIM_PATCH_ATTEMPTS: u32 = 3;
 const LABEL_PATCH_ATTEMPTS: u32 = 5;
+const RESULT_PATCH_ATTEMPTS: u32 = 3;
 
 /// The kubelet may be unreachable through the apiserver proxy, and the check using
 /// this is advisory, so it must not hold up the queue behind it.
@@ -164,6 +168,30 @@ impl NodeFacts {
     }
 }
 
+/// The state is a label, so a fleet can be searched for the nodes a rollout
+/// failed on; the reason is an annotation, because a label value holds neither
+/// its length nor its punctuation.
+#[derive(Debug, Clone)]
+pub struct ResultKeys {
+    pub state: String,
+    pub error: String,
+    pub finished_at: String,
+}
+
+pub const STATE_FAILED: &str = "failed";
+pub const STATE_SUCCEEDED: &str = "succeeded";
+
+impl ResultKeys {
+    pub fn with_prefix(prefix: &str) -> Self {
+        let prefix = prefix.trim().trim_end_matches('/');
+        Self {
+            state: format!("{prefix}/result"),
+            error: format!("{prefix}/error"),
+            finished_at: format!("{prefix}/finished-at"),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct NodeOps {
     api: Api<Node>,
@@ -178,10 +206,13 @@ pub struct NodeOps {
     pub wait_ready: Option<Duration>,
     pub require_handlers: Vec<String>,
     pub kubelet_timeout_warn: Option<Duration>,
+    /// Where this run's verdict on a node is written. Every run writes one.
+    pub result_keys: ResultKeys,
+    result_failure_reported: Arc<AtomicBool>,
 }
 
 impl NodeOps {
-    pub fn new(client: &Client) -> Self {
+    pub fn new(client: &Client, tracking_prefix: &str) -> Self {
         Self {
             api: Api::all(client.clone()),
             client: client.clone(),
@@ -193,6 +224,8 @@ impl NodeOps {
             wait_ready: None,
             require_handlers: Vec::new(),
             kubelet_timeout_warn: None,
+            result_keys: ResultKeys::with_prefix(tracking_prefix),
+            result_failure_reported: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -273,6 +306,121 @@ impl NodeOps {
         self.lift_taints(node, expected_uid).await;
 
         Ok(())
+    }
+
+    /// What this run made of the node, readable once its Jobs are gone.
+    ///
+    /// Best-effort: a result that could not be recorded is a lost account of
+    /// what happened, not a thing that happened.
+    pub async fn record_failure(&self, node: &str, expected_uid: Option<&str>, reason: &str) {
+        self.record(node, expected_uid, Some((STATE_FAILED, Some(reason))))
+            .await
+    }
+
+    pub async fn record_success(&self, node: &str, expected_uid: Option<&str>) {
+        // A cleanup has taken away what a result would describe.
+        let result = (!self.remove_label).then_some((STATE_SUCCEEDED, None));
+        self.record(node, expected_uid, result).await
+    }
+
+    /// `result` of `None` clears whatever an earlier run left behind.
+    async fn record(
+        &self,
+        node: &str,
+        expected_uid: Option<&str>,
+        result: Option<(&str, Option<&str>)>,
+    ) {
+        let keys = &self.result_keys;
+        // A node name can by now belong to a different machine, and without the
+        // UID there is nothing to bracket the write with.
+        let Some(expected_uid) = expected_uid else {
+            debug!("node {node}: not recording its result, the UID it was selected as is unknown");
+            return;
+        };
+
+        let updates = vec![
+            (
+                keys.state.clone(),
+                result.map(|(state, _)| state.to_string()),
+            ),
+            (
+                keys.error.clone(),
+                result.and_then(|(_, error)| error).map(str::to_string),
+            ),
+            (
+                keys.finished_at.clone(),
+                result.map(|_| Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+            ),
+        ];
+
+        if let Err(err) = self.write_result(node, expected_uid, keys, &updates).await {
+            // A Role missing `patch` on nodes misses it for every node.
+            if !self.result_failure_reported.swap(true, Ordering::Relaxed) {
+                warn!(
+                    "node {node}: its result could not be recorded on the node itself ({err:#}); \
+                     the run's results will be in this log and in the Events it emits"
+                );
+            } else {
+                debug!("node {node}: its result could not be recorded on the node itself: {err:#}");
+            }
+        }
+    }
+
+    /// Guarded and retried, because the kubelet writes to nodes constantly.
+    async fn write_result(
+        &self,
+        node: &str,
+        expected_uid: &str,
+        keys: &ResultKeys,
+        updates: &[(String, Option<String>)],
+    ) -> Result<()> {
+        for attempt in 1..=RESULT_PATCH_ATTEMPTS {
+            let fetched = self.get(node).await?;
+            anyhow::ensure!(
+                fetched.metadata.uid.as_deref() == Some(expected_uid),
+                "node {node} changed identity before its result could be recorded"
+            );
+            let version = fetched
+                .metadata
+                .resource_version
+                .clone()
+                .unwrap_or_default();
+            let labels = fetched.metadata.labels.unwrap_or_default();
+            let annotations = fetched.metadata.annotations.unwrap_or_default();
+
+            // Nothing to say about a node that already carries this result.
+            let Some(ops) =
+                result_patch_ops(expected_uid, &version, keys, &labels, &annotations, updates)
+            else {
+                return Ok(());
+            };
+
+            let patch: json_patch::Patch =
+                serde_json::from_value(json!(ops)).context("could not build the result patch")?;
+            match self
+                .api
+                .patch(node, &PatchParams::default(), &Patch::Json::<Node>(patch))
+                .await
+            {
+                Ok(_) => {
+                    info!("node {node}: recorded {}", describe_updates(updates));
+                    return Ok(());
+                }
+                Err(err) if is_precondition_failure(&err) => {
+                    debug!(
+                        "node {node}: it changed while its result was being recorded \
+                         (attempt {attempt}/{RESULT_PATCH_ATTEMPTS}); reading it again"
+                    );
+                }
+                Err(err) => {
+                    return Err(err).context(format!("could not record the result on node {node}"))
+                }
+            }
+        }
+
+        anyhow::bail!(
+            "gave up recording the result on node {node} after {RESULT_PATCH_ATTEMPTS} attempts"
+        )
     }
 
     /// Demoted rather than removed, so that nothing new is selected onto the node
@@ -891,15 +1039,67 @@ struct GuardedPatchError {
     error: anyhow::Error,
 }
 
+/// Longer than a label value or a timestamp, so what it elides is a failure
+/// reason the log already carries above.
+const LOGGED_VALUE_LIMIT: usize = 40;
+
 fn describe_updates(updates: &[(String, Option<String>)]) -> String {
     updates
         .iter()
         .map(|(key, value)| match value {
-            Some(value) => format!("{key}={value}"),
+            Some(value) if value.chars().count() <= LOGGED_VALUE_LIMIT => format!("{key}={value}"),
+            Some(_) => format!("{key} (written)"),
             None => format!("{key} (removed)"),
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The guarded patch recording a node's result, or `None` when the node already
+/// says exactly this.
+fn result_patch_ops(
+    expected_uid: &str,
+    version: &str,
+    keys: &ResultKeys,
+    labels: &BTreeMap<String, String>,
+    annotations: &BTreeMap<String, String>,
+    updates: &[(String, Option<String>)],
+) -> Option<Vec<serde_json::Value>> {
+    let mut ops = vec![
+        json!({"op": "test", "path": "/metadata/uid", "value": expected_uid}),
+        json!({"op": "test", "path": "/metadata/resourceVersion", "value": version}),
+    ];
+    // `add` needs its parent to exist, and a node may carry neither map.
+    if labels.is_empty() {
+        ops.push(json!({"op": "add", "path": "/metadata/labels", "value": {}}));
+    }
+    if annotations.is_empty() {
+        ops.push(json!({"op": "add", "path": "/metadata/annotations", "value": {}}));
+    }
+
+    let mut changes = 0;
+    for (key, value) in updates {
+        let in_labels = key == &keys.state;
+        let parent = if in_labels { "labels" } else { "annotations" };
+        let present = if in_labels {
+            labels.get(key)
+        } else {
+            annotations.get(key)
+        };
+        let path = format!("/metadata/{parent}/{}", escape_pointer(key));
+
+        match value {
+            Some(value) if present == Some(value) => continue,
+            Some(value) => ops.push(json!({"op": "add", "path": path, "value": value})),
+            // `remove` fails on a key that is already gone, and a result that was
+            // never recorded is nothing to clear.
+            None if present.is_none() => continue,
+            None => ops.push(json!({"op": "remove", "path": path})),
+        }
+        changes += 1;
+    }
+
+    (changes > 0).then_some(ops)
 }
 
 /// `~` and `/` have a meaning of their own in a JSON Pointer (RFC 6901).
@@ -1445,5 +1645,216 @@ mod tests {
 
         assert_eq!(node_ready_condition(&node).as_deref(), Some("True"));
         assert_eq!(node_ready_condition(&Node::default()), None);
+    }
+
+    fn result_keys() -> ResultKeys {
+        ResultKeys::with_prefix(MARKER_PREFIX)
+    }
+
+    fn failure_updates(keys: &ResultKeys, reason: &str) -> Vec<(String, Option<String>)> {
+        vec![
+            (keys.state.clone(), Some(STATE_FAILED.to_string())),
+            (keys.error.clone(), Some(reason.to_string())),
+            (
+                keys.finished_at.clone(),
+                Some("2026-01-01T00:00:00Z".into()),
+            ),
+        ]
+    }
+
+    fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_recorded_failure_reason_is_not_said_twice() {
+        let keys = result_keys();
+        let said = describe_updates(&failure_updates(
+            &keys,
+            "load-kernel-modules exited 1: this node has no usable virtualization backend",
+        ));
+
+        assert!(
+            said.contains("deployer.example.com/result=failed"),
+            "{said}"
+        );
+        assert!(
+            said.contains("deployer.example.com/error (written)"),
+            "{said}"
+        );
+        assert!(!said.contains("virtualization backend"), "{said}");
+    }
+
+    #[test]
+    fn a_result_splits_across_labels_and_annotations() {
+        let keys = result_keys();
+        let ops = result_patch_ops(
+            "uid-1",
+            "42",
+            &keys,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &failure_updates(&keys, "host-check exited 1"),
+        )
+        .expect("a node with no result recorded needs one written");
+
+        assert_eq!(
+            ops[0],
+            json!({"op": "test", "path": "/metadata/uid", "value": "uid-1"})
+        );
+        assert_eq!(
+            ops[1],
+            json!({"op": "test", "path": "/metadata/resourceVersion", "value": "42"})
+        );
+        // Neither map exists yet.
+        assert_eq!(
+            ops[2],
+            json!({"op": "add", "path": "/metadata/labels", "value": {}})
+        );
+        assert_eq!(
+            ops[3],
+            json!({"op": "add", "path": "/metadata/annotations", "value": {}})
+        );
+        assert_eq!(
+            ops[4],
+            json!({
+                "op": "add",
+                "path": "/metadata/labels/deployer.example.com~1result",
+                "value": "failed",
+            })
+        );
+        assert_eq!(
+            ops[5],
+            json!({
+                "op": "add",
+                "path": "/metadata/annotations/deployer.example.com~1error",
+                "value": "host-check exited 1",
+            })
+        );
+    }
+
+    #[test]
+    fn an_existing_labels_map_is_not_recreated() {
+        let keys = result_keys();
+        let ops = result_patch_ops(
+            "uid-1",
+            "42",
+            &keys,
+            &map(&[("kubernetes.io/hostname", "worker-2")]),
+            &BTreeMap::new(),
+            &failure_updates(&keys, "host-check exited 1"),
+        )
+        .expect("a node with no result recorded needs one written");
+
+        assert!(
+            !ops.iter()
+                .any(|op| op["path"] == "/metadata/labels" && op["op"] == "add"),
+            "recreating the map would drop the labels already on the node: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn an_existing_annotations_map_is_not_recreated() {
+        let keys = result_keys();
+        let ops = result_patch_ops(
+            "uid-1",
+            "42",
+            &keys,
+            &BTreeMap::new(),
+            &map(&[("something.else/key", "value")]),
+            &failure_updates(&keys, "host-check exited 1"),
+        )
+        .expect("a node with no result recorded needs one written");
+
+        assert!(
+            !ops.iter()
+                .any(|op| op["path"] == "/metadata/annotations" && op["op"] == "add"),
+            "recreating the map would drop the annotations already on the node: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn a_node_already_saying_this_is_left_alone() {
+        let keys = result_keys();
+        let recorded = "2026-01-01T00:00:00Z";
+        let ops = result_patch_ops(
+            "uid-1",
+            "42",
+            &keys,
+            &map(&[(keys.state.as_str(), STATE_FAILED)]),
+            &map(&[
+                (keys.error.as_str(), "host-check exited 1"),
+                (keys.finished_at.as_str(), recorded),
+            ]),
+            &[
+                (keys.state.clone(), Some(STATE_FAILED.to_string())),
+                (keys.error.clone(), Some("host-check exited 1".to_string())),
+                (keys.finished_at.clone(), Some(recorded.to_string())),
+            ],
+        );
+
+        assert!(ops.is_none());
+    }
+
+    #[test]
+    fn clearing_only_removes_what_is_there() {
+        let keys = result_keys();
+        let ops = result_patch_ops(
+            "uid-1",
+            "42",
+            &keys,
+            &map(&[(keys.state.as_str(), STATE_FAILED)]),
+            &map(&[(keys.error.as_str(), "host-check exited 1")]),
+            &[
+                (keys.state.clone(), None),
+                (keys.error.clone(), None),
+                (keys.finished_at.clone(), None),
+            ],
+        )
+        .expect("a node carrying an old result needs it cleared");
+
+        let removals: Vec<_> = ops
+            .iter()
+            .filter(|op| op["op"] == "remove")
+            .map(|op| op["path"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            removals,
+            vec![
+                "/metadata/labels/deployer.example.com~1result",
+                "/metadata/annotations/deployer.example.com~1error",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_result_keys_share_the_tracking_prefix() {
+        let keys = ResultKeys::with_prefix("kata-deploy-job-dispatcher/");
+
+        assert_eq!(keys.state, "kata-deploy-job-dispatcher/result");
+        assert_eq!(keys.error, "kata-deploy-job-dispatcher/error");
+        assert_eq!(keys.finished_at, "kata-deploy-job-dispatcher/finished-at");
+    }
+
+    #[test]
+    fn a_node_with_nothing_to_clear_is_not_patched() {
+        let keys = result_keys();
+        let ops = result_patch_ops(
+            "uid-1",
+            "42",
+            &keys,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &[
+                (keys.state.clone(), None),
+                (keys.error.clone(), None),
+                (keys.finished_at.clone(), None),
+            ],
+        );
+
+        assert!(ops.is_none());
     }
 }

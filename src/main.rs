@@ -10,9 +10,11 @@
 //! ignores already-completed pods. A DaemonSet gives the coverage but never
 //! finishes, so there is nothing to gate an upgrade on.
 
+mod diagnosis;
 mod job;
 mod node_filter;
 mod nodes;
+mod report;
 
 use anyhow::{bail, Context, Result};
 use clap::{ArgGroup, Parser};
@@ -25,11 +27,12 @@ use k8s_openapi::api::core::v1::{Node, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{Api, DeleteParams, ListParams, PostParams};
 use kube::Client;
-use log::{error, info};
+use log::{error, info, warn};
 use node_filter::{
     describe_taint, partition_by_tolerations, suggested_toleration, PodAdmission, SkippedNode,
 };
 use nodes::{InstanceMarker, NodeFacts, NodeLabelling, NodeOps, DEFAULT_PENDING_LABEL_VALUE};
+use report::Reporter;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -43,6 +46,19 @@ const JOB_READ_ERROR_BUDGET: Duration = Duration::from_secs(300);
 /// Bounds a single status read, so one slow apiserver request cannot hold every
 /// other node behind it.
 const JOB_GET_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long a Job may go without its pod running before the run says what it is
+/// waiting on. Such a Job does not fail until its deadline expires, which is an
+/// hour of a rollout looking busy on the usual settings.
+const WAITING_REPORT_AFTER: Duration = Duration::from_secs(120);
+
+/// And how often afterwards. The reason is re-read, so a node that moves from
+/// unschedulable to pulling says so.
+const WAITING_REPORT_EVERY: Duration = Duration::from_secs(300);
+
+/// Saying an unchanged tally every poll buries everything else in the log, and
+/// Helm prints that log as a single line.
+const PROGRESS_HEARTBEAT: Duration = Duration::from_secs(60);
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -225,8 +241,11 @@ struct Args {
 // Overwhelmingly I/O-bound, so two workers keep the footprint small.
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
+    // Helm prints this log as one escaped line, where the module path is width
+    // spent on nothing.
     env_logger::Builder::from_default_env()
         .filter_level(log::LevelFilter::Info)
+        .format_target(false)
         .init();
 
     let args = Args::parse();
@@ -550,7 +569,7 @@ fn check_taint_flags(args: &Args) -> Result<()> {
 fn node_ops_from_args(client: &Client, args: &Args) -> Result<NodeOps> {
     check_taint_flags(args)?;
 
-    let mut ops = NodeOps::new(client);
+    let mut ops = NodeOps::new(client, &args.tracking_label_prefix);
 
     ops.labelling = labelling_from_args(args)?;
     ops.label_value = args.node_label.clone();
@@ -981,6 +1000,57 @@ fn owning_job_of_pod(pod: &Pod, pod_name: &str) -> Result<OwnerReference> {
         })
 }
 
+/// A node the run could not finish, and what stopped it. The reason is kept so
+/// that the summary at the end can name it, not only the log.
+struct NodeFailure {
+    node: String,
+    reason: String,
+}
+
+/// Everything a node's result is written to, in one place, so that no path can
+/// report to the log and forget the cluster.
+///
+/// Written as each node finishes: a dispatcher killed halfway through - a
+/// release timeout, its own node drained - would otherwise take the whole
+/// account with it.
+struct Outcomes {
+    ops: Arc<NodeOps>,
+    reporter: Reporter,
+}
+
+impl Outcomes {
+    async fn failed(&self, node: Option<&Node>, name: &str, reason: String) -> NodeFailure {
+        error!("node {name}: {reason}");
+        self.ops.record_failure(name, uid_of(node), &reason).await;
+        if let Some(node) = node {
+            self.reporter.node_failed(node, &reason).await;
+        }
+        NodeFailure {
+            node: name.to_string(),
+            reason,
+        }
+    }
+
+    async fn succeeded(&self, node: Option<&Node>, name: &str) {
+        self.ops.record_success(name, uid_of(node)).await;
+        if let Some(node) = node {
+            self.reporter.node_succeeded(node).await;
+        }
+    }
+
+    /// Not a result: the node is still being worked on.
+    async fn waiting(&self, node: Option<&Node>, name: &str, detail: &str) {
+        warn!("node {name}: {detail}");
+        if let Some(node) = node {
+            self.reporter.node_waiting(node, detail).await;
+        }
+    }
+}
+
+fn uid_of(node: Option<&Node>) -> Option<&str> {
+    node?.metadata.uid.as_deref()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_fanout(
     jobs: &Api<Job>,
@@ -997,7 +1067,24 @@ async fn run_fanout(
     let mut queue: VecDeque<Node> = nodes.iter().cloned().collect();
     let mut in_flight: HashMap<String, String> = HashMap::new();
     let mut succeeded = 0usize;
-    let mut failed: Vec<String> = Vec::new();
+    let mut failed: Vec<NodeFailure> = Vec::new();
+
+    // So that a failure discovered by node name alone can still be reported
+    // against the object.
+    let by_name: HashMap<&str, &Node> = nodes
+        .iter()
+        .filter_map(|node| Some((node.metadata.name.as_deref()?, node)))
+        .collect();
+    let outcomes = Outcomes {
+        ops: node_ops.clone(),
+        reporter: Reporter::new(client, &args.tracking_label_prefix),
+    };
+
+    // Read only when a Job fails or stalls; the Job's status holds no reason.
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let mut dispatched_at: HashMap<String, Instant> = HashMap::new();
+    // When each Job was last asked what it waits for, and what it said.
+    let mut reported_waiting: HashMap<String, (Instant, Option<String>)> = HashMap::new();
 
     let post = PostParams::default();
     let poll = Duration::from_secs(args.poll_interval_secs.max(1));
@@ -1011,6 +1098,7 @@ async fn run_fanout(
     let mut post_work: JoinSet<Result<()>> = JoinSet::new();
     let mut post_nodes: HashMap<tokio::task::Id, String> = HashMap::new();
     let mut unreadable: HashMap<String, Instant> = HashMap::new();
+    let mut progress = Progress::default();
 
     loop {
         while in_flight.len() + post_work.len() < parallelism {
@@ -1022,8 +1110,15 @@ async fn run_fanout(
                 continue;
             };
             let Some(expected_uid) = selected.metadata.uid.as_deref() else {
-                error!("node {node}: the selected Node has no UID; refusing to dispatch to it");
-                failed.push(node.to_string());
+                failed.push(
+                    outcomes
+                        .failed(
+                            Some(&selected),
+                            node,
+                            "the selected Node has no UID; refusing to dispatch to it".to_string(),
+                        )
+                        .await,
+                );
                 continue;
             };
 
@@ -1033,18 +1128,34 @@ async fn run_fanout(
             let fresh = match node_ops.get(node).await {
                 Ok(fresh) => fresh,
                 Err(err) => {
-                    error!("node {node}: could not re-read it before dispatch ({err:#})");
-                    failed.push(node.to_string());
+                    failed.push(
+                        outcomes
+                            .failed(
+                                Some(&selected),
+                                node,
+                                format!("could not re-read it before dispatch ({err:#})"),
+                            )
+                            .await,
+                    );
                     continue;
                 }
             };
             if fresh.metadata.uid.as_deref() != Some(expected_uid) {
-                error!(
-                    "node {node}: was selected as UID {expected_uid} but now has UID {:?}; \
-                     refusing to mutate a replacement machine under a stale identity",
-                    fresh.metadata.uid
+                failed.push(
+                    outcomes
+                        // No node object: the machine now answering to this
+                        // name was never acted on.
+                        .failed(
+                            None,
+                            node,
+                            format!(
+                                "was selected as UID {expected_uid} but now has UID {:?}; \
+                                 refusing to mutate a replacement machine under a stale identity",
+                                fresh.metadata.uid
+                            ),
+                        )
+                        .await,
                 );
-                failed.push(node.to_string());
                 continue;
             }
 
@@ -1062,11 +1173,17 @@ async fn run_fanout(
                 // under a running rollout is not an instruction to dismantle a
                 // host. A later run starts by cleaning what it owns but no longer
                 // selects, and picks this node up if it is still out.
-                error!(
-                    "node {node}: no longer matches the selection; refusing to act on a stale \
-                     selection, leaving the node as it is"
+                failed.push(
+                    outcomes
+                        .failed(
+                            Some(&fresh),
+                            node,
+                            "no longer matches the selection; refusing to act on a stale \
+                             selection, leaving the node as it is"
+                                .to_string(),
+                        )
+                        .await,
                 );
-                failed.push(node.to_string());
                 continue;
             }
 
@@ -1078,42 +1195,64 @@ async fn run_fanout(
                     &template_admission(template),
                 );
                 if admitted.is_empty() {
-                    error!(
-                        "node {node}: acquired the untolerated taint {} before dispatch; refusing \
-                         to start a Job the taint manager would evict",
-                        skipped
-                            .first()
-                            .map(|item| describe_taint(&item.taint))
-                            .unwrap_or_else(|| "<unknown>".to_string())
+                    failed.push(
+                        outcomes
+                            .failed(
+                                Some(&fresh),
+                                node,
+                                format!(
+                                    "acquired the untolerated taint {} before dispatch; refusing \
+                                     to start a Job the taint manager would evict",
+                                    skipped
+                                        .first()
+                                        .map(|item| describe_taint(&item.taint))
+                                        .unwrap_or_else(|| "<unknown>".to_string())
+                                ),
+                            )
+                            .await,
                     );
-                    failed.push(node.to_string());
                     continue;
                 }
             }
 
             let node_facts = NodeFacts::from_node(&fresh);
             if args.require_node_runtime_version && node_facts.container_runtime_version.is_none() {
-                error!(
-                    "node {node}: reports no containerRuntimeVersion and \
-                     --require-node-runtime-version is set"
+                failed.push(
+                    outcomes
+                        .failed(
+                            Some(&fresh),
+                            node,
+                            "reports no containerRuntimeVersion and \
+                             --require-node-runtime-version is set"
+                                .to_string(),
+                        )
+                        .await,
                 );
-                failed.push(node.to_string());
                 continue;
             }
             if args.require_node_machine_id && node_facts.machine_id.is_none() {
-                error!(
-                    "node {node}: reports no machineID and --require-node-machine-id is set, so a \
-                     token-free Job could not defend against node-name reuse"
+                failed.push(
+                    outcomes
+                        .failed(
+                            Some(&fresh),
+                            node,
+                            "reports no machineID and --require-node-machine-id is set, so a \
+                             token-free Job could not defend against node-name reuse"
+                                .to_string(),
+                        )
+                        .await,
                 );
-                failed.push(node.to_string());
                 continue;
             }
 
             // Fails the node rather than proceeding: for cleanup, proceeding would
             // dismantle a node still advertising itself as ready.
             if let Err(err) = node_ops.before_dispatch(node, expected_uid).await {
-                error!("node {node}: {err:#}");
-                failed.push(node.to_string());
+                failed.push(
+                    outcomes
+                        .failed(Some(&fresh), node, format!("{err:#}"))
+                        .await,
+                );
                 continue;
             }
 
@@ -1143,18 +1282,29 @@ async fn run_fanout(
                             info!("job {name} (node {node}) was left by an earlier run, recreated")
                         }
                         Err(err) => {
-                            error!("node {node}: {err:#}");
-                            failed.push(node.to_string());
+                            failed.push(
+                                outcomes
+                                    .failed(Some(&fresh), node, format!("{err:#}"))
+                                    .await,
+                            );
                             continue;
                         }
                     }
                 }
                 Err(e) => {
-                    error!("failed to create job {name} (node {node}): {e}");
-                    failed.push(node.to_string());
+                    failed.push(
+                        outcomes
+                            .failed(
+                                Some(&fresh),
+                                node,
+                                format!("its job {name} could not be created: {e}"),
+                            )
+                            .await,
+                    );
                     continue;
                 }
             }
+            dispatched_at.insert(name.clone(), Instant::now());
             in_flight.insert(name, node.to_string());
         }
 
@@ -1166,7 +1316,15 @@ async fn run_fanout(
         // on the poll interval.
         if in_flight.is_empty() {
             if let Some(joined) = post_work.join_next_with_id().await {
-                record_post_work(joined, &mut post_nodes, &mut succeeded, &mut failed);
+                record_post_work(
+                    joined,
+                    &mut post_nodes,
+                    &mut succeeded,
+                    &mut failed,
+                    &outcomes,
+                    &by_name,
+                )
+                .await;
             }
             continue;
         }
@@ -1197,23 +1355,37 @@ async fn run_fanout(
                 // Waiting for a Job that no longer exists never ends, so the node
                 // fails and a later run retries it.
                 Ok(Err(kube::Error::Api(e))) if e.code == 404 => {
-                    error!(
-                        "node {node}: job {name} no longer exists, so its result cannot be \
-                         established; treating the node as failed"
+                    failed.push(
+                        outcomes
+                            .failed(
+                                by_name.get(node.as_str()).copied(),
+                                &node,
+                                format!(
+                                    "its job {name} no longer exists, so its result cannot be \
+                                     established"
+                                ),
+                            )
+                            .await,
                     );
-                    failed.push(node);
                     finished.push(name);
                     continue;
                 }
                 Ok(Err(e)) => {
                     let since = unreadable[&name];
                     if since.elapsed() >= JOB_READ_ERROR_BUDGET {
-                        error!(
-                            "node {node}: job {name} has been unreadable for {}s ({e}), so its \
-                             result cannot be established; treating the node as failed",
-                            since.elapsed().as_secs()
+                        failed.push(
+                            outcomes
+                                .failed(
+                                    by_name.get(node.as_str()).copied(),
+                                    &node,
+                                    format!(
+                                        "its job {name} has been unreadable for {}s ({e}), so its \
+                                         result cannot be established",
+                                        since.elapsed().as_secs()
+                                    ),
+                                )
+                                .await,
                         );
-                        failed.push(node);
                         finished.push(name);
                     } else {
                         error!("failed to get job {name} (node {node}): {e}");
@@ -1223,13 +1395,21 @@ async fn run_fanout(
                 Err(_) => {
                     let since = unreadable[&name];
                     if since.elapsed() >= JOB_READ_ERROR_BUDGET {
-                        error!(
-                            "node {node}: job {name} has been unreadable for {}s because its GET \
-                             requests keep timing out after {}s; treating the node as failed",
-                            since.elapsed().as_secs(),
-                            JOB_GET_TIMEOUT.as_secs()
+                        failed.push(
+                            outcomes
+                                .failed(
+                                    by_name.get(node.as_str()).copied(),
+                                    &node,
+                                    format!(
+                                        "its job {name} has been unreadable for {}s because its \
+                                         GET requests keep timing out after {}s, so its result \
+                                         cannot be established",
+                                        since.elapsed().as_secs(),
+                                        JOB_GET_TIMEOUT.as_secs()
+                                    ),
+                                )
+                                .await,
                         );
-                        failed.push(node);
                         finished.push(name);
                     } else {
                         error!(
@@ -1245,13 +1425,20 @@ async fn run_fanout(
                 JobOutcome::Succeeded => {
                     finished.push(name.clone());
                     info!("node {node}: job {name} succeeded");
-                    let Some(expected_uid) = nodes
-                        .iter()
-                        .find(|candidate| candidate.metadata.name.as_deref() == Some(node.as_str()))
+                    let Some(expected_uid) = by_name
+                        .get(node.as_str())
                         .and_then(|candidate| candidate.metadata.uid.clone())
                     else {
-                        error!("node {node}: the selected Node UID is gone from dispatcher state");
-                        failed.push(node);
+                        failed.push(
+                            outcomes
+                                .failed(
+                                    None,
+                                    &node,
+                                    "the selected Node UID is gone from dispatcher state"
+                                        .to_string(),
+                                )
+                                .await,
+                        );
                         continue;
                     };
                     let ops = node_ops.clone();
@@ -1261,47 +1448,184 @@ async fn run_fanout(
                     post_nodes.insert(handle.id(), node);
                 }
                 JobOutcome::Failed => {
-                    error!("node {node}: job {name} failed");
-                    failed.push(node);
+                    // Read now, before the Job's TTL takes the pod away.
+                    let last_seen = reported_waiting
+                        .get(&name)
+                        .and_then(|(_, why)| why.as_deref());
+                    let why = diagnosis::why_the_job_failed(&pods, &j, &name, last_seen).await;
+                    failed.push(
+                        outcomes
+                            .failed(
+                                by_name.get(node.as_str()).copied(),
+                                &node,
+                                format!("its job {name} failed: {why}"),
+                            )
+                            .await,
+                    );
                     finished.push(name);
                 }
-                JobOutcome::Running => {}
+                JobOutcome::Running => {
+                    report_if_stalled(
+                        &pods,
+                        &outcomes,
+                        by_name.get(node.as_str()).copied(),
+                        &node,
+                        &name,
+                        &dispatched_at,
+                        &mut reported_waiting,
+                    )
+                    .await;
+                }
             }
         }
         for name in finished {
             in_flight.remove(&name);
             unreadable.remove(&name);
+            dispatched_at.remove(&name);
+            reported_waiting.remove(&name);
         }
 
         while let Some(joined) = post_work.try_join_next_with_id() {
-            record_post_work(joined, &mut post_nodes, &mut succeeded, &mut failed);
+            record_post_work(
+                joined,
+                &mut post_nodes,
+                &mut succeeded,
+                &mut failed,
+                &outcomes,
+                &by_name,
+            )
+            .await;
         }
 
-        info!(
-            "progress: {succeeded} succeeded, {} failed, {} in-flight, {} finishing, {} queued",
-            failed.len(),
-            in_flight.len(),
-            post_work.len(),
-            queue.len()
-        );
+        progress.report(Tally {
+            succeeded,
+            failed: failed.len(),
+            in_flight: in_flight.len(),
+            finishing: post_work.len(),
+            queued: queue.len(),
+        });
     }
 
     if !failed.is_empty() {
-        failed.sort();
-        failed.dedup();
-        bail!(
-            "{} node(s) failed: {}. Inspect the per-node Job logs with: \
-             kubectl logs -n {} -l {}={} --all-containers --prefix",
-            failed.len(),
-            failed.join(", "),
-            namespace,
-            tracking.owner,
-            owner_value
-        );
+        bail!(summarize(failed, namespace, &tracking.owner, &owner_value));
     }
 
     info!("all {succeeded} node(s) completed successfully");
     Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Tally {
+    succeeded: usize,
+    failed: usize,
+    in_flight: usize,
+    finishing: usize,
+    queued: usize,
+}
+
+#[derive(Default)]
+struct Progress {
+    said: Option<Tally>,
+    said_at: Option<Instant>,
+}
+
+impl Progress {
+    fn report(&mut self, tally: Tally) {
+        if !self.worth_saying(&tally) {
+            return;
+        }
+        self.said = Some(tally);
+        self.said_at = Some(Instant::now());
+        let Tally {
+            succeeded,
+            failed,
+            in_flight,
+            finishing,
+            queued,
+        } = tally;
+        info!(
+            "progress: {succeeded} succeeded, {failed} failed, {in_flight} in-flight, \
+             {finishing} finishing, {queued} queued"
+        );
+    }
+
+    fn worth_saying(&self, tally: &Tally) -> bool {
+        if self.said.as_ref() != Some(tally) {
+            return true;
+        }
+        self.said_at
+            .is_none_or(|at| at.elapsed() >= PROGRESS_HEARTBEAT)
+    }
+}
+
+/// The run's last word, and for anyone who ran `helm install` the only one
+/// they will see.
+fn summarize(
+    mut failed: Vec<NodeFailure>,
+    namespace: &str,
+    owner_label: &str,
+    owner_value: &str,
+) -> String {
+    failed.sort_by(|left, right| left.node.cmp(&right.node));
+    // Two entries mean two paths reported one node; the first is what happened.
+    failed.dedup_by(|left, right| left.node == right.node);
+
+    let mut summary = format!("{} node(s) failed:", failed.len());
+    for failure in &failed {
+        summary.push_str(&format!("\n  {}: {}", failure.node, failure.reason));
+    }
+    summary.push_str(&format!(
+        "\nThe full logs of the per-node Jobs that are still around: \
+         kubectl logs -n {namespace} -l {owner_label}={owner_value} --all-containers --prefix"
+    ));
+    summary
+}
+
+/// Say what a Job that is getting nowhere is waiting for, since running is not
+/// a state the Job controller reports on.
+async fn report_if_stalled(
+    pods: &Api<Pod>,
+    outcomes: &Outcomes,
+    node: Option<&Node>,
+    name: &str,
+    job: &str,
+    dispatched_at: &HashMap<String, Instant>,
+    reported: &mut HashMap<String, (Instant, Option<String>)>,
+) {
+    let waited = match dispatched_at.get(job) {
+        Some(since) => since.elapsed(),
+        // Adopted from an earlier run, which is the one that knows.
+        None => return,
+    };
+    if waited < WAITING_REPORT_AFTER {
+        return;
+    }
+    if let Some((last, _)) = reported.get(job) {
+        if last.elapsed() < WAITING_REPORT_EVERY {
+            return;
+        }
+    }
+
+    // Recorded either way: asking costs a pod LIST, and a running Job answers
+    // nothing to every poll.
+    let asked_at = Instant::now();
+    let Some(detail) = diagnosis::what_the_job_waits_for(pods, job).await else {
+        let kept = reported.get(job).and_then(|(_, why)| why.clone());
+        reported.insert(job.to_string(), (asked_at, kept));
+        return;
+    };
+
+    reported.insert(job.to_string(), (asked_at, Some(detail.clone())));
+    outcomes
+        .waiting(
+            node,
+            name,
+            &format!(
+                "its job {job} has been going {}s without running: {detail}",
+                waited.as_secs()
+            ),
+        )
+        .await;
 }
 
 /// The Job driving another run of this name prefix, if one is still working.
@@ -1606,11 +1930,13 @@ async fn replace_job(jobs: &Api<Job>, name: &str, desired: &Job) -> Result<()> {
 
 /// A node whose Job passed but whose post-success work did not is a failed node:
 /// the work is only complete once the node is labelled.
-fn record_post_work(
+async fn record_post_work(
     joined: std::result::Result<(tokio::task::Id, Result<()>), tokio::task::JoinError>,
     post_nodes: &mut HashMap<tokio::task::Id, String>,
     succeeded: &mut usize,
-    failed: &mut Vec<String>,
+    failed: &mut Vec<NodeFailure>,
+    outcomes: &Outcomes,
+    by_name: &HashMap<&str, &Node>,
 ) {
     let (id, outcome) = match joined {
         Ok((id, outcome)) => (id, outcome),
@@ -1619,12 +1945,20 @@ fn record_post_work(
     let node = post_nodes
         .remove(&id)
         .unwrap_or_else(|| "<unknown>".to_string());
+    let object = by_name.get(node.as_str()).copied();
 
     match outcome {
-        Ok(()) => *succeeded += 1,
+        Ok(()) => {
+            *succeeded += 1;
+            info!("node {node}: done");
+            outcomes.succeeded(object, &node).await;
+        }
         Err(err) => {
-            error!("node {node}: its Job finished but {err:#}");
-            failed.push(node);
+            failed.push(
+                outcomes
+                    .failed(object, &node, format!("its Job finished but {err:#}"))
+                    .await,
+            );
         }
     }
 }
@@ -1640,6 +1974,30 @@ mod tests {
     #[test]
     fn no_selector_means_one_unfiltered_pass() {
         assert_eq!(selector_passes(&[]), vec![None]);
+    }
+
+    #[test]
+    fn a_tally_is_said_when_it_changes_and_when_it_goes_quiet() {
+        let waiting = Tally {
+            succeeded: 0,
+            failed: 0,
+            in_flight: 1,
+            finishing: 0,
+            queued: 0,
+        };
+        let mut progress = Progress::default();
+
+        assert!(progress.worth_saying(&waiting));
+        progress.report(waiting);
+        assert!(!progress.worth_saying(&waiting));
+        assert!(progress.worth_saying(&Tally {
+            succeeded: 1,
+            in_flight: 0,
+            ..waiting
+        }));
+
+        progress.said_at = Some(Instant::now() - PROGRESS_HEARTBEAT);
+        assert!(progress.worth_saying(&waiting));
     }
 
     #[test]
@@ -2115,6 +2473,66 @@ mod tests {
             labelling.instance.as_ref().map(InstanceMarker::key),
             Some("deployer.example.com/dev")
         );
+    }
+
+    #[test]
+    fn the_node_result_keys_follow_the_tracking_prefix() {
+        let args = args_from(&["--tracking-label-prefix=deployer.example.com"]);
+
+        let keys = nodes::ResultKeys::with_prefix(&args.tracking_label_prefix);
+        assert_eq!(keys.state, "deployer.example.com/result");
+    }
+
+    #[test]
+    fn the_summary_names_every_node_and_what_stopped_it() {
+        let failure = |node: &str, reason: &str| NodeFailure {
+            node: node.to_string(),
+            reason: reason.to_string(),
+        };
+
+        let summary = summarize(
+            vec![
+                failure(
+                    "worker-2",
+                    "its job failed: host-check exited 1: no /dev/kvm",
+                ),
+                failure("worker-1", "its pod is unschedulable"),
+            ],
+            "kube-system",
+            "k8s-job-dispatcher/owner",
+            "kata-deploy-install",
+        );
+
+        assert!(summary.starts_with("2 node(s) failed:"));
+        // Sorted, so two runs over the same fleet read the same way.
+        assert!(summary.contains("\n  worker-1: its pod is unschedulable\n  worker-2: its job failed: host-check exited 1: no /dev/kvm"));
+        assert!(summary.contains(
+            "kubectl logs -n kube-system -l k8s-job-dispatcher/owner=kata-deploy-install"
+        ));
+    }
+
+    /// Counting a node twice would misstate how much of the fleet is affected.
+    #[test]
+    fn a_node_is_summarized_once() {
+        let summary = summarize(
+            vec![
+                NodeFailure {
+                    node: "worker-1".to_string(),
+                    reason: "first".to_string(),
+                },
+                NodeFailure {
+                    node: "worker-1".to_string(),
+                    reason: "second".to_string(),
+                },
+            ],
+            "kube-system",
+            "owner",
+            "run",
+        );
+
+        assert!(summary.starts_with("1 node(s) failed:"));
+        assert!(summary.contains("worker-1: first"));
+        assert!(!summary.contains("second"));
     }
 
     #[test]
