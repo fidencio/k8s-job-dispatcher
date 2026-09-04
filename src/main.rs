@@ -56,6 +56,10 @@ const WAITING_REPORT_AFTER: Duration = Duration::from_secs(120);
 /// unschedulable to pulling says so.
 const WAITING_REPORT_EVERY: Duration = Duration::from_secs(300);
 
+/// Saying an unchanged tally every poll buries everything else in the log, and
+/// Helm prints that log as a single line.
+const PROGRESS_HEARTBEAT: Duration = Duration::from_secs(60);
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     author,
@@ -237,8 +241,11 @@ struct Args {
 // Overwhelmingly I/O-bound, so two workers keep the footprint small.
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
+    // Helm prints this log as one escaped line, where the module path is width
+    // spent on nothing.
     env_logger::Builder::from_default_env()
         .filter_level(log::LevelFilter::Info)
+        .format_target(false)
         .init();
 
     let args = Args::parse();
@@ -1091,6 +1098,7 @@ async fn run_fanout(
     let mut post_work: JoinSet<Result<()>> = JoinSet::new();
     let mut post_nodes: HashMap<tokio::task::Id, String> = HashMap::new();
     let mut unreadable: HashMap<String, Instant> = HashMap::new();
+    let mut progress = Progress::default();
 
     loop {
         while in_flight.len() + post_work.len() < parallelism {
@@ -1489,13 +1497,13 @@ async fn run_fanout(
             .await;
         }
 
-        info!(
-            "progress: {succeeded} succeeded, {} failed, {} in-flight, {} finishing, {} queued",
-            failed.len(),
-            in_flight.len(),
-            post_work.len(),
-            queue.len()
-        );
+        progress.report(Tally {
+            succeeded,
+            failed: failed.len(),
+            in_flight: in_flight.len(),
+            finishing: post_work.len(),
+            queued: queue.len(),
+        });
     }
 
     if !failed.is_empty() {
@@ -1504,6 +1512,50 @@ async fn run_fanout(
 
     info!("all {succeeded} node(s) completed successfully");
     Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Tally {
+    succeeded: usize,
+    failed: usize,
+    in_flight: usize,
+    finishing: usize,
+    queued: usize,
+}
+
+#[derive(Default)]
+struct Progress {
+    said: Option<Tally>,
+    said_at: Option<Instant>,
+}
+
+impl Progress {
+    fn report(&mut self, tally: Tally) {
+        if !self.worth_saying(&tally) {
+            return;
+        }
+        self.said = Some(tally);
+        self.said_at = Some(Instant::now());
+        let Tally {
+            succeeded,
+            failed,
+            in_flight,
+            finishing,
+            queued,
+        } = tally;
+        info!(
+            "progress: {succeeded} succeeded, {failed} failed, {in_flight} in-flight, \
+             {finishing} finishing, {queued} queued"
+        );
+    }
+
+    fn worth_saying(&self, tally: &Tally) -> bool {
+        if self.said.as_ref() != Some(tally) {
+            return true;
+        }
+        self.said_at
+            .is_none_or(|at| at.elapsed() >= PROGRESS_HEARTBEAT)
+    }
 }
 
 /// The run's last word, and for anyone who ran `helm install` the only one
@@ -1922,6 +1974,30 @@ mod tests {
     #[test]
     fn no_selector_means_one_unfiltered_pass() {
         assert_eq!(selector_passes(&[]), vec![None]);
+    }
+
+    #[test]
+    fn a_tally_is_said_when_it_changes_and_when_it_goes_quiet() {
+        let waiting = Tally {
+            succeeded: 0,
+            failed: 0,
+            in_flight: 1,
+            finishing: 0,
+            queued: 0,
+        };
+        let mut progress = Progress::default();
+
+        assert!(progress.worth_saying(&waiting));
+        progress.report(waiting);
+        assert!(!progress.worth_saying(&waiting));
+        assert!(progress.worth_saying(&Tally {
+            succeeded: 1,
+            in_flight: 0,
+            ..waiting
+        }));
+
+        progress.said_at = Some(Instant::now() - PROGRESS_HEARTBEAT);
+        assert!(progress.worth_saying(&waiting));
     }
 
     #[test]
