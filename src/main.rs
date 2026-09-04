@@ -10,6 +10,7 @@
 //! ignores already-completed pods. A DaemonSet gives the coverage but never
 //! finishes, so there is nothing to gate an upgrade on.
 
+mod diagnosis;
 mod job;
 mod node_filter;
 mod nodes;
@@ -981,6 +982,23 @@ fn owning_job_of_pod(pod: &Pod, pod_name: &str) -> Result<OwnerReference> {
         })
 }
 
+/// A node the run could not finish, and what stopped it. The reason is kept so
+/// that the summary at the end can name it, not only the log.
+struct NodeFailure {
+    node: String,
+    reason: String,
+}
+
+impl NodeFailure {
+    fn new(node: &str, reason: String) -> Self {
+        error!("node {node}: {reason}");
+        Self {
+            node: node.to_string(),
+            reason,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_fanout(
     jobs: &Api<Job>,
@@ -997,7 +1015,10 @@ async fn run_fanout(
     let mut queue: VecDeque<Node> = nodes.iter().cloned().collect();
     let mut in_flight: HashMap<String, String> = HashMap::new();
     let mut succeeded = 0usize;
-    let mut failed: Vec<String> = Vec::new();
+    let mut failed: Vec<NodeFailure> = Vec::new();
+
+    // Read only when a Job fails; the Job's status holds no reason.
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
 
     let post = PostParams::default();
     let poll = Duration::from_secs(args.poll_interval_secs.max(1));
@@ -1022,8 +1043,10 @@ async fn run_fanout(
                 continue;
             };
             let Some(expected_uid) = selected.metadata.uid.as_deref() else {
-                error!("node {node}: the selected Node has no UID; refusing to dispatch to it");
-                failed.push(node.to_string());
+                failed.push(NodeFailure::new(
+                    node,
+                    "the selected Node has no UID; refusing to dispatch to it".to_string(),
+                ));
                 continue;
             };
 
@@ -1033,18 +1056,22 @@ async fn run_fanout(
             let fresh = match node_ops.get(node).await {
                 Ok(fresh) => fresh,
                 Err(err) => {
-                    error!("node {node}: could not re-read it before dispatch ({err:#})");
-                    failed.push(node.to_string());
+                    failed.push(NodeFailure::new(
+                        node,
+                        format!("could not re-read it before dispatch ({err:#})"),
+                    ));
                     continue;
                 }
             };
             if fresh.metadata.uid.as_deref() != Some(expected_uid) {
-                error!(
-                    "node {node}: was selected as UID {expected_uid} but now has UID {:?}; \
-                     refusing to mutate a replacement machine under a stale identity",
-                    fresh.metadata.uid
-                );
-                failed.push(node.to_string());
+                failed.push(NodeFailure::new(
+                    node,
+                    format!(
+                        "was selected as UID {expected_uid} but now has UID {:?}; refusing to \
+                         mutate a replacement machine under a stale identity",
+                        fresh.metadata.uid
+                    ),
+                ));
                 continue;
             }
 
@@ -1062,11 +1089,12 @@ async fn run_fanout(
                 // under a running rollout is not an instruction to dismantle a
                 // host. A later run starts by cleaning what it owns but no longer
                 // selects, and picks this node up if it is still out.
-                error!(
-                    "node {node}: no longer matches the selection; refusing to act on a stale \
-                     selection, leaving the node as it is"
-                );
-                failed.push(node.to_string());
+                failed.push(NodeFailure::new(
+                    node,
+                    "no longer matches the selection; refusing to act on a stale selection, \
+                     leaving the node as it is"
+                        .to_string(),
+                ));
                 continue;
             }
 
@@ -1078,42 +1106,45 @@ async fn run_fanout(
                     &template_admission(template),
                 );
                 if admitted.is_empty() {
-                    error!(
-                        "node {node}: acquired the untolerated taint {} before dispatch; refusing \
-                         to start a Job the taint manager would evict",
-                        skipped
-                            .first()
-                            .map(|item| describe_taint(&item.taint))
-                            .unwrap_or_else(|| "<unknown>".to_string())
-                    );
-                    failed.push(node.to_string());
+                    failed.push(NodeFailure::new(
+                        node,
+                        format!(
+                            "acquired the untolerated taint {} before dispatch; refusing to \
+                             start a Job the taint manager would evict",
+                            skipped
+                                .first()
+                                .map(|item| describe_taint(&item.taint))
+                                .unwrap_or_else(|| "<unknown>".to_string())
+                        ),
+                    ));
                     continue;
                 }
             }
 
             let node_facts = NodeFacts::from_node(&fresh);
             if args.require_node_runtime_version && node_facts.container_runtime_version.is_none() {
-                error!(
-                    "node {node}: reports no containerRuntimeVersion and \
+                failed.push(NodeFailure::new(
+                    node,
+                    "reports no containerRuntimeVersion and \
                      --require-node-runtime-version is set"
-                );
-                failed.push(node.to_string());
+                        .to_string(),
+                ));
                 continue;
             }
             if args.require_node_machine_id && node_facts.machine_id.is_none() {
-                error!(
-                    "node {node}: reports no machineID and --require-node-machine-id is set, so a \
+                failed.push(NodeFailure::new(
+                    node,
+                    "reports no machineID and --require-node-machine-id is set, so a \
                      token-free Job could not defend against node-name reuse"
-                );
-                failed.push(node.to_string());
+                        .to_string(),
+                ));
                 continue;
             }
 
             // Fails the node rather than proceeding: for cleanup, proceeding would
             // dismantle a node still advertising itself as ready.
             if let Err(err) = node_ops.before_dispatch(node, expected_uid).await {
-                error!("node {node}: {err:#}");
-                failed.push(node.to_string());
+                failed.push(NodeFailure::new(node, format!("{err:#}")));
                 continue;
             }
 
@@ -1143,15 +1174,16 @@ async fn run_fanout(
                             info!("job {name} (node {node}) was left by an earlier run, recreated")
                         }
                         Err(err) => {
-                            error!("node {node}: {err:#}");
-                            failed.push(node.to_string());
+                            failed.push(NodeFailure::new(node, format!("{err:#}")));
                             continue;
                         }
                     }
                 }
                 Err(e) => {
-                    error!("failed to create job {name} (node {node}): {e}");
-                    failed.push(node.to_string());
+                    failed.push(NodeFailure::new(
+                        node,
+                        format!("its job {name} could not be created: {e}"),
+                    ));
                     continue;
                 }
             }
@@ -1197,23 +1229,27 @@ async fn run_fanout(
                 // Waiting for a Job that no longer exists never ends, so the node
                 // fails and a later run retries it.
                 Ok(Err(kube::Error::Api(e))) if e.code == 404 => {
-                    error!(
-                        "node {node}: job {name} no longer exists, so its result cannot be \
-                         established; treating the node as failed"
-                    );
-                    failed.push(node);
+                    failed.push(NodeFailure::new(
+                        &node,
+                        format!(
+                            "its job {name} no longer exists, so its result cannot be \
+                             established"
+                        ),
+                    ));
                     finished.push(name);
                     continue;
                 }
                 Ok(Err(e)) => {
                     let since = unreadable[&name];
                     if since.elapsed() >= JOB_READ_ERROR_BUDGET {
-                        error!(
-                            "node {node}: job {name} has been unreadable for {}s ({e}), so its \
-                             result cannot be established; treating the node as failed",
-                            since.elapsed().as_secs()
-                        );
-                        failed.push(node);
+                        failed.push(NodeFailure::new(
+                            &node,
+                            format!(
+                                "its job {name} has been unreadable for {}s ({e}), so its \
+                                 result cannot be established",
+                                since.elapsed().as_secs()
+                            ),
+                        ));
                         finished.push(name);
                     } else {
                         error!("failed to get job {name} (node {node}): {e}");
@@ -1223,13 +1259,16 @@ async fn run_fanout(
                 Err(_) => {
                     let since = unreadable[&name];
                     if since.elapsed() >= JOB_READ_ERROR_BUDGET {
-                        error!(
-                            "node {node}: job {name} has been unreadable for {}s because its GET \
-                             requests keep timing out after {}s; treating the node as failed",
-                            since.elapsed().as_secs(),
-                            JOB_GET_TIMEOUT.as_secs()
-                        );
-                        failed.push(node);
+                        failed.push(NodeFailure::new(
+                            &node,
+                            format!(
+                                "its job {name} has been unreadable for {}s because its GET \
+                                 requests keep timing out after {}s, so its result cannot be \
+                                 established",
+                                since.elapsed().as_secs(),
+                                JOB_GET_TIMEOUT.as_secs()
+                            ),
+                        ));
                         finished.push(name);
                     } else {
                         error!(
@@ -1250,8 +1289,10 @@ async fn run_fanout(
                         .find(|candidate| candidate.metadata.name.as_deref() == Some(node.as_str()))
                         .and_then(|candidate| candidate.metadata.uid.clone())
                     else {
-                        error!("node {node}: the selected Node UID is gone from dispatcher state");
-                        failed.push(node);
+                        failed.push(NodeFailure::new(
+                            &node,
+                            "the selected Node UID is gone from dispatcher state".to_string(),
+                        ));
                         continue;
                     };
                     let ops = node_ops.clone();
@@ -1261,8 +1302,12 @@ async fn run_fanout(
                     post_nodes.insert(handle.id(), node);
                 }
                 JobOutcome::Failed => {
-                    error!("node {node}: job {name} failed");
-                    failed.push(node);
+                    // Read now, before the Job's TTL takes the pod away.
+                    let why = diagnosis::why_the_job_failed(&pods, &j, &name).await;
+                    failed.push(NodeFailure::new(
+                        &node,
+                        format!("its job {name} failed: {why}"),
+                    ));
                     finished.push(name);
                 }
                 JobOutcome::Running => {}
@@ -1287,21 +1332,34 @@ async fn run_fanout(
     }
 
     if !failed.is_empty() {
-        failed.sort();
-        failed.dedup();
-        bail!(
-            "{} node(s) failed: {}. Inspect the per-node Job logs with: \
-             kubectl logs -n {} -l {}={} --all-containers --prefix",
-            failed.len(),
-            failed.join(", "),
-            namespace,
-            tracking.owner,
-            owner_value
-        );
+        bail!(summarize(failed, namespace, &tracking.owner, &owner_value));
     }
 
     info!("all {succeeded} node(s) completed successfully");
     Ok(())
+}
+
+/// The run's last word, and for anyone who ran `helm install` the only one
+/// they will see.
+fn summarize(
+    mut failed: Vec<NodeFailure>,
+    namespace: &str,
+    owner_label: &str,
+    owner_value: &str,
+) -> String {
+    failed.sort_by(|left, right| left.node.cmp(&right.node));
+    // Two entries mean two paths reported one node; the first is what happened.
+    failed.dedup_by(|left, right| left.node == right.node);
+
+    let mut summary = format!("{} node(s) failed:", failed.len());
+    for failure in &failed {
+        summary.push_str(&format!("\n  {}: {}", failure.node, failure.reason));
+    }
+    summary.push_str(&format!(
+        "\nThe full logs of the per-node Jobs that are still around: \
+         kubectl logs -n {namespace} -l {owner_label}={owner_value} --all-containers --prefix"
+    ));
+    summary
 }
 
 /// The Job driving another run of this name prefix, if one is still working.
@@ -1610,7 +1668,7 @@ fn record_post_work(
     joined: std::result::Result<(tokio::task::Id, Result<()>), tokio::task::JoinError>,
     post_nodes: &mut HashMap<tokio::task::Id, String>,
     succeeded: &mut usize,
-    failed: &mut Vec<String>,
+    failed: &mut Vec<NodeFailure>,
 ) {
     let (id, outcome) = match joined {
         Ok((id, outcome)) => (id, outcome),
@@ -1623,8 +1681,10 @@ fn record_post_work(
     match outcome {
         Ok(()) => *succeeded += 1,
         Err(err) => {
-            error!("node {node}: its Job finished but {err:#}");
-            failed.push(node);
+            failed.push(NodeFailure::new(
+                &node,
+                format!("its Job finished but {err:#}"),
+            ));
         }
     }
 }
@@ -2115,6 +2175,58 @@ mod tests {
             labelling.instance.as_ref().map(InstanceMarker::key),
             Some("deployer.example.com/dev")
         );
+    }
+
+    #[test]
+    fn the_summary_names_every_node_and_what_stopped_it() {
+        let failure = |node: &str, reason: &str| NodeFailure {
+            node: node.to_string(),
+            reason: reason.to_string(),
+        };
+
+        let summary = summarize(
+            vec![
+                failure(
+                    "worker-2",
+                    "its job failed: host-check exited 1: no /dev/kvm",
+                ),
+                failure("worker-1", "its pod is unschedulable"),
+            ],
+            "kube-system",
+            "k8s-job-dispatcher/owner",
+            "kata-deploy-install",
+        );
+
+        assert!(summary.starts_with("2 node(s) failed:"));
+        // Sorted, so two runs over the same fleet read the same way.
+        assert!(summary.contains("\n  worker-1: its pod is unschedulable\n  worker-2: its job failed: host-check exited 1: no /dev/kvm"));
+        assert!(summary.contains(
+            "kubectl logs -n kube-system -l k8s-job-dispatcher/owner=kata-deploy-install"
+        ));
+    }
+
+    /// Counting a node twice would misstate how much of the fleet is affected.
+    #[test]
+    fn a_node_is_summarized_once() {
+        let summary = summarize(
+            vec![
+                NodeFailure {
+                    node: "worker-1".to_string(),
+                    reason: "first".to_string(),
+                },
+                NodeFailure {
+                    node: "worker-1".to_string(),
+                    reason: "second".to_string(),
+                },
+            ],
+            "kube-system",
+            "owner",
+            "run",
+        );
+
+        assert!(summary.starts_with("1 node(s) failed:"));
+        assert!(summary.contains("worker-1: first"));
+        assert!(!summary.contains("second"));
     }
 
     #[test]
