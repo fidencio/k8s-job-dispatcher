@@ -154,19 +154,23 @@ rules:
     verbs: ["get", "list", "patch"]
   - apiGroups: ["batch"]
     resources: ["jobs"]
-    verbs: ["create", "get", "list", "delete"]
+    verbs: ["create", "get"]
 ```
 
 `get` on nodes is needed by the pre-dispatch revalidation and `patch` by the
 result every run records on the node — which the node-label flags and
-`--remove-node-taints` then need nothing beyond. `list` on Jobs is needed by the
-stale-Job cleanup and by `--yield-to-live-run`; the status polling itself only
-uses `get`.
+`--remove-node-taints` then need nothing beyond. On Jobs, `create` fans out and
+`get` polls.
+
+A run given an owner needs `jobs: ["list", "delete"]` on top of that: only an
+`ownerReference` tells this run's Jobs from an earlier run's, so a run without
+one leaves the leftovers alone rather than sweeping them, and cannot
+`--yield-to-live-run` either. `--owner-job-name` also needs `get` on the owning
+Job, which the rule above already covers, while `--owner-job-from-pod` needs
+`pods: ["get"]` to read the pod's own `ownerReferences`.
 
 `nodes/proxy: ["get"]` is additionally needed for
-`--kubelet-timeout-warn-secs`. `--owner-job-name` needs `get` on the owning Job,
-which the rule above already covers, while `--owner-job-from-pod` needs
-`pods: ["get"]` to read the pod's own `ownerReferences`.
+`--kubelet-timeout-warn-secs`.
 
 Every run reports what became of each node, which means listing the pods a failed
 Job left behind and publishing the answer as an Event, so grant both:
