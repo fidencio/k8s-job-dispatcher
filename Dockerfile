@@ -53,10 +53,30 @@ RUN touch src/main.rs && \
 	cargo build --release --locked --target "${RUST_TARGET}" && \
 	cp "target/${RUST_TARGET}/release/k8s-job-dispatcher" /usr/local/bin/k8s-job-dispatcher
 
+# The notices are one text for every architecture, so this runs on the build
+# host rather than four times under emulation. --platform is ignored on a FROM
+# naming a stage, which is why this repeats the image instead of deriving from
+# rust-base; dependabot moves both lines as one dependency.
+FROM --platform=$BUILDPLATFORM rust:1.98.0-trixie AS notices
+
+WORKDIR /src
+
+# Ahead of the manifests, so a dependency bump does not rebuild the tool. The
+# binary sits behind `cli`.
+RUN cargo install cargo-about --version 0.9.2 --locked --features cli
+
+# Needs an entry point to exist, but never compiles one.
+COPY Cargo.toml Cargo.lock about.toml about.hbs ./
+RUN mkdir -p src && echo 'fn main() {}' > src/main.rs && \
+	cargo about generate about.hbs -o THIRD-PARTY-NOTICES.txt && \
+	rm -rf src
+
 # Lets a release ship the binary without anyone unpacking an image:
 # --target binary --output type=local.
 FROM scratch AS binary
 COPY --from=builder /usr/local/bin/k8s-job-dispatcher /
+COPY --from=notices /src/THIRD-PARTY-NOTICES.txt /
+COPY LICENSE /
 
 # distroless publishes only rolling tags, so :latest is how it is consumed.
 # hadolint ignore=DL3007
@@ -78,6 +98,10 @@ FROM runtime-glibc AS runtime-s390x
 FROM runtime-${TARGETARCH}
 
 COPY --from=builder /usr/local/bin/k8s-job-dispatcher /usr/bin/k8s-job-dispatcher
+
+# Where a licence scanner looks.
+COPY --from=notices /src/THIRD-PARTY-NOTICES.txt /usr/share/doc/k8s-job-dispatcher/
+COPY LICENSE /usr/share/doc/k8s-job-dispatcher/
 
 USER 65532:65532
 
