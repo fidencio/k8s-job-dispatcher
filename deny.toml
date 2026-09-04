@@ -23,6 +23,9 @@ allow = [
     "Unicode-3.0",
     # subtle, via sha2's constant-time primitives.
     "BSD-3-Clause",
+    # webpki-root-certs is CCADB's root CA list, so a permissive data licence
+    # rather than a software one.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 
