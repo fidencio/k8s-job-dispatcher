@@ -65,6 +65,9 @@ jobs:
               - '**/*.toml'
               - '**/*.lock'
               - '.github/workflows/ci.yaml'
+              # Both end up inside the image.
+              - 'about.hbs'
+              - 'LICENSE'
 
   formatting:
     name: cargo fmt
@@ -298,3 +301,19 @@ jobs:
             echo "::error::${ARCH} binary is not ${want}"
             exit 1
           }
+
+      # Generated rather than committed, so nothing else would notice them
+      # silently not being produced. The two ship from different stages.
+      - name: Check both carry the third-party notices
+        env:
+          IMAGE: k8s-job-dispatcher:ci-${{ matrix.arch }}
+        run: |
+          test -s dist/LICENSE
+          grep -q '^Applies to:' dist/THIRD-PARTY-NOTICES.txt
+          cid="$(docker create "${IMAGE}")"
+          trap 'docker rm -f "${cid}" > /dev/null' EXIT
+          doc=/usr/share/doc/k8s-job-dispatcher
+          docker cp "${cid}:${doc}/THIRD-PARTY-NOTICES.txt" notices.txt
+          docker cp "${cid}:${doc}/LICENSE" license.txt
+          test -s license.txt
+          grep -q '^Applies to:' notices.txt

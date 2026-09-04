@@ -109,21 +109,24 @@ jobs:
             arch="${dir#dist/linux_}"
             tar --sort=name --owner=0 --group=0 --numeric-owner \
               --mtime="@${epoch}" -cf - \
-              -C "${dir}" k8s-job-dispatcher \
-              -C "${GITHUB_WORKSPACE}" LICENSE \
+              -C "${dir}" k8s-job-dispatcher LICENSE THIRD-PARTY-NOTICES.txt \
               | gzip -n -9 > "out/k8s-job-dispatcher-${VERSION}-linux-${arch}.tar.gz"
           done
 
-      # From Cargo.lock rather than the binary: syft reads the resolved crate
-      # graph there, while a stripped binary tells it only its own name. One file
-      # covers every architecture, since the lockfile is what they all build.
-      - uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+      # cargo metadata rather than Cargo.lock, which records no licence for
+      # anything, so syft could only ever write NOASSERTION. Drops the
+      # dev-dependencies too, which are in nothing shipped.
+      - name: Install the pinned Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
+        with:
+          tool: cargo-sbom@0.10.0
 
       - name: Generate the SBOM
         env:
           VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          syft scan file:Cargo.lock -o spdx-json \
+          cargo sbom --output-format=spdx_json_2_3 \
             > "out/k8s-job-dispatcher-${VERSION}.spdx.json"
 
       # Cheap to check, and the only thing a consumer without the gh CLI can
@@ -225,8 +228,10 @@ jobs:
               gh attestation verify oci://ghcr.io/${GITHUB_REPOSITORY}@<digest> \\
                 --repo ${GITHUB_REPOSITORY} --bundle-from-oci
 
-          The SBOM is SPDX, resolved from Cargo.lock, so it covers every
-          architecture.
+          The SBOM is SPDX, resolved from the crate graph, so it covers every
+          architecture and records the licence each crate is under. Those
+          licences are reproduced in full in THIRD-PARTY-NOTICES.txt, in every
+          tarball and in the image under /usr/share/doc/k8s-job-dispatcher.
           EOF
           )"
           prerelease=()

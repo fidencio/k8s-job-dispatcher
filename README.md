@@ -94,10 +94,18 @@ might still fail after writing the label.
 ## Usage
 
 The image is published to `ghcr.io/kata-containers/k8s-job-dispatcher`. Each
-release also attaches a `.tar.gz` per architecture holding just the binary, for
-anyone packaging it themselves rather than running the image, an SPDX SBOM
-resolved from `Cargo.lock`, and `SHA256SUMS`. The tarballs are reproducible:
-same commit, same bytes.
+release also attaches a `.tar.gz` per architecture holding the binary, its
+licence and `THIRD-PARTY-NOTICES.txt`, for anyone packaging it themselves rather
+than running the image, an SPDX SBOM resolved from the crate graph and recording
+the licence each crate is under, and `SHA256SUMS`. The tarballs are
+reproducible: same commit, same bytes.
+
+The image carries the same two files under
+`/usr/share/doc/k8s-job-dispatcher`. Both are written during the build by
+[cargo-about](https://github.com/EmbarkStudios/cargo-about) from `about.toml`
+and `about.hbs`, so they describe the binary beside them rather than whatever
+the tree looked like when somebody last remembered to regenerate them. Which
+licences may appear at all is `deny.toml`'s decision, enforced in CI.
 
 Everything carries GitHub build provenance, so what a release claims to be can
 be checked rather than assumed:
@@ -125,8 +133,8 @@ somewhere it exists; the artefact's architecture is unrelated to the verifier's.
 
 The amd64 and arm64 binaries are statically linked and need nothing. The ppc64le
 and s390x ones need glibc and `libgcc_s.so.1`, for the reason described under
-[Building](#building). The image carries both; the tarball is only the binary,
-so whoever packages those provides them.
+[Building](#building). The image carries both; the tarball carries neither, so
+whoever packages those provides them.
 
 ```bash
 k8s-job-dispatcher \

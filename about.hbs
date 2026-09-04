@@ -1,0 +1,24 @@
+Third-party notices for k8s-job-dispatcher
+==========================================
+
+Generated during the build by `cargo about generate`, from about.toml and
+about.hbs. Covers the crates compiled into the binary, for every architecture a
+release ships. The dispatcher itself is Apache-2.0, in the LICENSE beside this.
+
+{{#each overview}}
+  {{{name}}}: {{count}} crate{{#if (ne count 1)}}s{{/if}}
+{{/each}}
+
+{{#each licenses}}
+
+--------------------------------------------------------------------------------
+{{{name}}}
+--------------------------------------------------------------------------------
+
+Applies to:
+{{#each used_by}}
+  - {{{crate.name}}} {{{crate.version}}}{{#if crate.repository}} ({{{crate.repository}}}){{/if}}
+{{/each}}
+
+{{{text}}}
+{{/each}}
