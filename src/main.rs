@@ -27,7 +27,7 @@ use k8s_openapi::api::core::v1::{Node, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{Api, DeleteParams, ListParams, PostParams};
 use kube::Client;
-use log::{error, info};
+use log::{error, info, warn};
 use node_filter::{
     describe_taint, partition_by_tolerations, suggested_toleration, PodAdmission, SkippedNode,
 };
@@ -46,6 +46,15 @@ const JOB_READ_ERROR_BUDGET: Duration = Duration::from_secs(300);
 /// Bounds a single status read, so one slow apiserver request cannot hold every
 /// other node behind it.
 const JOB_GET_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long a Job may go without its pod running before the run says what it is
+/// waiting on. Such a Job does not fail until its deadline expires, which is an
+/// hour of a rollout looking busy on the usual settings.
+const WAITING_REPORT_AFTER: Duration = Duration::from_secs(120);
+
+/// And how often afterwards. The reason is re-read, so a node that moves from
+/// unschedulable to pulling says so.
+const WAITING_REPORT_EVERY: Duration = Duration::from_secs(300);
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -1021,6 +1030,14 @@ impl Outcomes {
             self.reporter.node_succeeded(node).await;
         }
     }
+
+    /// Not a result: the node is still being worked on.
+    async fn waiting(&self, node: Option<&Node>, name: &str, detail: &str) {
+        warn!("node {name}: {detail}");
+        if let Some(node) = node {
+            self.reporter.node_waiting(node, detail).await;
+        }
+    }
 }
 
 fn uid_of(node: Option<&Node>) -> Option<&str> {
@@ -1056,8 +1073,11 @@ async fn run_fanout(
         reporter: Reporter::new(client, &args.tracking_label_prefix),
     };
 
-    // Read only when a Job fails; the Job's status holds no reason.
+    // Read only when a Job fails or stalls; the Job's status holds no reason.
     let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let mut dispatched_at: HashMap<String, Instant> = HashMap::new();
+    // When each Job was last asked what it waits for, and what it said.
+    let mut reported_waiting: HashMap<String, (Instant, Option<String>)> = HashMap::new();
 
     let post = PostParams::default();
     let poll = Duration::from_secs(args.poll_interval_secs.max(1));
@@ -1276,6 +1296,7 @@ async fn run_fanout(
                     continue;
                 }
             }
+            dispatched_at.insert(name.clone(), Instant::now());
             in_flight.insert(name, node.to_string());
         }
 
@@ -1420,7 +1441,10 @@ async fn run_fanout(
                 }
                 JobOutcome::Failed => {
                     // Read now, before the Job's TTL takes the pod away.
-                    let why = diagnosis::why_the_job_failed(&pods, &j, &name).await;
+                    let last_seen = reported_waiting
+                        .get(&name)
+                        .and_then(|(_, why)| why.as_deref());
+                    let why = diagnosis::why_the_job_failed(&pods, &j, &name, last_seen).await;
                     failed.push(
                         outcomes
                             .failed(
@@ -1432,12 +1456,25 @@ async fn run_fanout(
                     );
                     finished.push(name);
                 }
-                JobOutcome::Running => {}
+                JobOutcome::Running => {
+                    report_if_stalled(
+                        &pods,
+                        &outcomes,
+                        by_name.get(node.as_str()).copied(),
+                        &node,
+                        &name,
+                        &dispatched_at,
+                        &mut reported_waiting,
+                    )
+                    .await;
+                }
             }
         }
         for name in finished {
             in_flight.remove(&name);
             unreadable.remove(&name);
+            dispatched_at.remove(&name);
+            reported_waiting.remove(&name);
         }
 
         while let Some(joined) = post_work.try_join_next_with_id() {
@@ -1490,6 +1527,53 @@ fn summarize(
          kubectl logs -n {namespace} -l {owner_label}={owner_value} --all-containers --prefix"
     ));
     summary
+}
+
+/// Say what a Job that is getting nowhere is waiting for, since running is not
+/// a state the Job controller reports on.
+async fn report_if_stalled(
+    pods: &Api<Pod>,
+    outcomes: &Outcomes,
+    node: Option<&Node>,
+    name: &str,
+    job: &str,
+    dispatched_at: &HashMap<String, Instant>,
+    reported: &mut HashMap<String, (Instant, Option<String>)>,
+) {
+    let waited = match dispatched_at.get(job) {
+        Some(since) => since.elapsed(),
+        // Adopted from an earlier run, which is the one that knows.
+        None => return,
+    };
+    if waited < WAITING_REPORT_AFTER {
+        return;
+    }
+    if let Some((last, _)) = reported.get(job) {
+        if last.elapsed() < WAITING_REPORT_EVERY {
+            return;
+        }
+    }
+
+    // Recorded either way: asking costs a pod LIST, and a running Job answers
+    // nothing to every poll.
+    let asked_at = Instant::now();
+    let Some(detail) = diagnosis::what_the_job_waits_for(pods, job).await else {
+        let kept = reported.get(job).and_then(|(_, why)| why.clone());
+        reported.insert(job.to_string(), (asked_at, kept));
+        return;
+    };
+
+    reported.insert(job.to_string(), (asked_at, Some(detail.clone())));
+    outcomes
+        .waiting(
+            node,
+            name,
+            &format!(
+                "its job {job} has been going {}s without running: {detail}",
+                waited.as_secs()
+            ),
+        )
+        .await;
 }
 
 /// The Job driving another run of this name prefix, if one is still working.

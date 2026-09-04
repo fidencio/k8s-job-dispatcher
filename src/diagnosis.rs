@@ -32,7 +32,12 @@ const CRASH_LOOP: &str = "CrashLoopBackOff";
 ///
 /// Never fails: this already runs on a failure path, and a diagnosis that
 /// cannot be read is not a second failure.
-pub async fn why_the_job_failed(pods: &Api<Pod>, job: &Job, name: &str) -> String {
+pub async fn why_the_job_failed(
+    pods: &Api<Pod>,
+    job: &Job,
+    name: &str,
+    last_seen: Option<&str>,
+) -> String {
     let from_pod = match newest_pod(pods, name).await {
         Ok(Some(pod)) => describe_failed_pod(&pod),
         Ok(None) => None,
@@ -42,15 +47,60 @@ pub async fn why_the_job_failed(pods: &Api<Pod>, job: &Job, name: &str) -> Strin
         }
     };
 
-    let diagnosis = match (from_pod, job_failure_condition(job)) {
-        // The Job's reason - deadline, retries - frames what the container said.
+    // A Job that hit its deadline has had its pods deleted by the Job
+    // controller, so what the run saw while it waited is all that is left.
+    let from_pod = from_pod.or_else(|| last_seen.map(str::to_string));
+
+    shorten(frame(from_pod, job_failure_condition(job)))
+}
+
+/// The Job's reason - a deadline, the retries - frames what the pod said.
+fn frame(from_pod: Option<String>, from_job: Option<String>) -> String {
+    match (from_pod, from_job) {
         (Some(pod), Some(job)) => format!("{pod} [{job}]"),
         (Some(pod), None) => pod,
         (None, Some(job)) => job,
         (None, None) => "the Job reports no reason and left no pod behind to ask".to_string(),
+    }
+}
+
+/// What a Job that has not finished is stuck on. `None` means it is running.
+///
+/// A pod that never starts produces no Job failure until the deadline runs out,
+/// which is an hour of silence on the default settings.
+pub async fn what_the_job_waits_for(pods: &Api<Pod>, name: &str) -> Option<String> {
+    let pod = match newest_pod(pods, name).await {
+        Ok(Some(pod)) => pod,
+        // Quota, a webhook, or a suspended Job: the Job exists and nothing runs.
+        Ok(None) => return Some("no pod has been created for it".to_string()),
+        Err(err) => {
+            debug!("could not read the pods of job {name}: {err}");
+            return None;
+        }
     };
 
-    shorten(diagnosis)
+    let status = pod.status.as_ref()?;
+    if status.phase.as_deref() == Some("Running") {
+        return None;
+    }
+
+    if let Some(detail) = container_statuses(&pod).find_map(describe_container) {
+        return Some(shorten(detail));
+    }
+
+    let unschedulable = status
+        .conditions
+        .iter()
+        .flatten()
+        .find(|condition| condition.type_ == "PodScheduled" && condition.status == "False")?;
+    let detail = match trimmed(unschedulable.message.as_deref()) {
+        Some(message) => format!("its pod is unschedulable: {message}"),
+        None => format!(
+            "its pod is unschedulable: {}",
+            unschedulable.reason.as_deref().unwrap_or("no reason given")
+        ),
+    };
+    Some(shorten(detail))
 }
 
 /// A retried Job has a pod per attempt, and the last one is the verdict.
@@ -334,6 +384,30 @@ mod tests {
         assert_eq!(describe_failed_pod(&pod("  phase: Failed\n")), None);
     }
 
+    /// Otherwise a Job killed by its deadline reports the deadline and nothing
+    /// about the pull or the taint that ran the clock down.
+    #[test]
+    fn a_deleted_pod_leaves_what_the_run_last_saw() {
+        let stalled = "cri never started: ImagePullBackOff: Back-off pulling image";
+
+        assert_eq!(
+            frame(
+                Some(stalled.to_string()),
+                Some("DeadlineExceeded: Job was active longer than specified deadline".to_string())
+            ),
+            "cri never started: ImagePullBackOff: Back-off pulling image [DeadlineExceeded: Job \
+             was active longer than specified deadline]"
+        );
+        assert_eq!(
+            frame(None, Some("BackoffLimitExceeded".to_string())),
+            "BackoffLimitExceeded"
+        );
+        assert_eq!(
+            frame(None, None),
+            "the Job reports no reason and left no pod behind to ask"
+        );
+    }
+
     #[rstest]
     #[case(
         "  conditions:\n    - type: Failed\n      status: \"True\"\n      reason: DeadlineExceeded\n      message: Job was active longer than specified deadline\n",
@@ -357,6 +431,13 @@ mod tests {
             job_failure_condition(&job(status_yaml)).as_deref(),
             expected
         );
+    }
+
+    #[test]
+    fn a_running_pod_is_not_waiting_for_anything() {
+        let pod = pod("  phase: Running\n  containerStatuses:\n    - name: cri\n      state:\n        running:\n          startedAt: \"2026-01-01T00:00:00Z\"\n");
+        assert!(pod.status.as_ref().unwrap().phase.as_deref() == Some("Running"));
+        assert_eq!(container_statuses(&pod).find_map(describe_container), None);
     }
 
     #[test]

@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const FAILED: &str = "JobFailed";
 const SUCCEEDED: &str = "JobSucceeded";
+const WAITING: &str = "JobPending";
 
 const WARNING: &str = "Warning";
 const NORMAL: &str = "Normal";
@@ -52,6 +53,10 @@ impl Reporter {
     pub async fn node_succeeded(&self, node: &Node) {
         self.emit(node, NORMAL, SUCCEEDED, "the node's Job completed")
             .await;
+    }
+
+    pub async fn node_waiting(&self, node: &Node, detail: &str) {
+        self.emit(node, WARNING, WAITING, detail).await;
     }
 
     async fn emit(&self, node: &Node, kind: &str, reason: &str, message: &str) {
