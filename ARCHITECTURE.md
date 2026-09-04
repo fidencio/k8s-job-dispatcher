@@ -40,27 +40,34 @@ upgrade pipeline: the process exits non-zero and names the nodes that failed.
 
 ## Structure
 
-Four modules, split by the kind of reasoning each one does rather than by the
+Six modules, split by the kind of reasoning each one does rather than by the
 API objects they touch.
 
 ```mermaid
 flowchart TB
     main["**main.rs**<br>orchestration: selection, pacing,<br>convergence, exit status"]
     job["**job.rs**<br>Job construction, naming,<br>tracking labels, status reading"]
-    nodes["**nodes.rs**<br>node-scoped API work:<br>labels, taints, readiness"]
+    nodes["**nodes.rs**<br>node-scoped API work:<br>labels, taints, readiness, results"]
     filter["**node_filter.rs**<br>DaemonSet-equivalent<br>taint admission"]
+    diagnosis["**diagnosis.rs**<br>why a Job failed or stalled,<br>read from its pod"]
+    report["**report.rs**<br>the result as an Event<br>against the Node"]
 
     main --> job
     main --> nodes
     main --> filter
+    main --> diagnosis
+    main --> report
     nodes -. "NodeFacts" .-> job
 ```
 
 `main.rs` is the only module that decides anything about *ordering*. `job.rs` is
 pure: given a template and a node it produces a Job object, and given a Job it
 reports an outcome. `node_filter.rs` is pure as well, and answers exactly one
-question: would a DaemonSet's pod have been admitted to this node? `nodes.rs`
-holds every write to a Node object, which is where the concurrency hazards live.
+question: would a DaemonSet's pod have been admitted to this node? `diagnosis.rs`
+is pure once its pod is read, and turns a pod into one line of English.
+`nodes.rs` holds every write to a Node object, which is where the concurrency
+hazards live — the node's result among them, since it is written the same guarded
+way as its labels.
 
 The separation is load-bearing for testing. Selection, admission, naming,
 sanitization, ownership arithmetic and status interpretation are all decidable
@@ -530,6 +537,49 @@ nowhere counts: nothing matched, and everything matched carrying a taint we do n
 tolerate. The second is a forgotten toleration for a run that expected nodes, and
 a node on its way up for one that repeats.
 
+### Where a failure ends up
+
+A Job's status says that it failed and nothing more, so a run reporting no more
+than that hands its reader a node name and a search. The search usually fails:
+whatever `ttlSecondsAfterFinished` the template carries deletes the per-node Job,
+usually minutes after it finished, and takes its pods and their logs with it.
+
+So the pod is read at the moment the Job is judged, while it is still there, and
+the reason is carried on the node's result from then on. What the pod is asked
+for, in order: the first container to terminate non-zero, with its exit code, any
+reason the kubelet gave it (`OOMKilled` says what an exit code cannot), and its
+**termination message**, which is where a well-behaved image writes why it is
+giving up and which, unlike a log, lives in the pod's own status; failing that, a
+container that never started and what stopped it; failing that, the pod's own
+`reason` and `message`, which is where an eviction shows up. The Job's `Failed`
+condition is kept as the frame around all of it — deadline, or retries exhausted.
+
+The same read answers a question the Job controller never asks. A Job whose pod
+cannot be scheduled or cannot pull its image is not failed and never will be
+until `activeDeadlineSeconds` expires, so a rollout blocked on one looks busy for
+as long as the deadline allows. Two minutes into a Job that is not running, and
+every five after that, the pod is read for what it is waiting on and the run says
+so.
+
+That result is written to the **Node**, the one object in a rollout that outlives
+the run, twice over: as an Event, which is what `kubectl describe node` shows and
+what event pipelines already collect, and as a label and annotations on the node
+itself, which is what is still there once the apiserver has dropped the Event.
+The Event lands in `default` rather than the run's own namespace, which is the
+only one the apiserver accepts an Event about a namespace-less object in. Each is written as its node finishes rather than at the end of the
+run: what a node was left in is the answer somebody needs, and a dispatcher
+killed halfway through — a release timeout, its own node drained — would
+otherwise take the whole account with it.
+
+Neither write is a mode. There is no flag for either, because a run that has to
+be asked to explain itself is a run nobody asked: the flag would be missing from
+precisely the deployment that later has a node nobody can account for, and by
+then the pods that held the answer are gone. What the dispatcher does about a
+cluster that refuses the write is say so once and carry on — a result that could
+not be recorded is a lost account of what happened, not a thing that happened,
+and failing a node over an Event quota or a Role short a verb would report
+healthy hosts as broken.
+
 ## Multi-Instance Ownership
 
 The dispatcher writes the *caller's* label key, never one of its own choosing,
@@ -604,6 +654,13 @@ only for the stale-Job sweep and for `--yield-to-live-run`, and a deployment tha
 names no owner does neither and needs neither. `patch` on nodes appears only with the label and taint
 flags, `nodes/proxy` only with the advisory kubelet timeout check, and `get` on
 pods only when the owner is derived from one.
+
+The two that every deployment should grant are `list` on pods, which buys the
+reason a node failed, and `create` on events, which publishes it. They are the
+exception to the paragraph above — not asked for by a feature, because reporting
+is not one — and they are still not *required*: a deployment that grants neither
+gets a report with the Job's own `Failed` condition as the whole of it, which is
+the situation this section exists to keep people out of.
 
 The privilege that is *not* on this list is the interesting one: the per-node
 Jobs, which are the privileged half of the operation, hold no credentials at
