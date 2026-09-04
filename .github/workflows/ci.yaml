@@ -179,7 +179,7 @@ jobs:
       - name: Install the pinned Rust toolchain
         uses: ./.github/actions/rust-toolchain
       # Prebuilt, so this does not compile the tool from source on every run.
-      - uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
+      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
         with:
           tool: cargo-deny
       - run: cargo deny --locked check
@@ -200,7 +200,7 @@ jobs:
         with:
           toolchain: nightly
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
+      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
         with:
           tool: cargo-udeps
       - run: cargo udeps --locked --all-features
