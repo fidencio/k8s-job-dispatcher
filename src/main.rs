@@ -14,6 +14,7 @@ mod diagnosis;
 mod job;
 mod node_filter;
 mod nodes;
+mod report;
 
 use anyhow::{bail, Context, Result};
 use clap::{ArgGroup, Parser};
@@ -31,6 +32,7 @@ use node_filter::{
     describe_taint, partition_by_tolerations, suggested_toleration, PodAdmission, SkippedNode,
 };
 use nodes::{InstanceMarker, NodeFacts, NodeLabelling, NodeOps, DEFAULT_PENDING_LABEL_VALUE};
+use report::Reporter;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -989,12 +991,31 @@ struct NodeFailure {
     reason: String,
 }
 
-impl NodeFailure {
-    fn new(node: &str, reason: String) -> Self {
-        error!("node {node}: {reason}");
-        Self {
-            node: node.to_string(),
+/// Everything a node's result is written to, in one place, so that no path can
+/// report to the log and forget the cluster.
+///
+/// Written as each node finishes: a dispatcher killed halfway through - a
+/// release timeout, its own node drained - would otherwise take the whole
+/// account with it.
+struct Outcomes {
+    reporter: Reporter,
+}
+
+impl Outcomes {
+    async fn failed(&self, node: Option<&Node>, name: &str, reason: String) -> NodeFailure {
+        error!("node {name}: {reason}");
+        if let Some(node) = node {
+            self.reporter.node_failed(node, &reason).await;
+        }
+        NodeFailure {
+            node: name.to_string(),
             reason,
+        }
+    }
+
+    async fn succeeded(&self, node: Option<&Node>) {
+        if let Some(node) = node {
+            self.reporter.node_succeeded(node).await;
         }
     }
 }
@@ -1016,6 +1037,16 @@ async fn run_fanout(
     let mut in_flight: HashMap<String, String> = HashMap::new();
     let mut succeeded = 0usize;
     let mut failed: Vec<NodeFailure> = Vec::new();
+
+    // So that a failure discovered by node name alone can still be reported
+    // against the object.
+    let by_name: HashMap<&str, &Node> = nodes
+        .iter()
+        .filter_map(|node| Some((node.metadata.name.as_deref()?, node)))
+        .collect();
+    let outcomes = Outcomes {
+        reporter: Reporter::new(client, &args.tracking_label_prefix),
+    };
 
     // Read only when a Job fails; the Job's status holds no reason.
     let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
@@ -1043,10 +1074,15 @@ async fn run_fanout(
                 continue;
             };
             let Some(expected_uid) = selected.metadata.uid.as_deref() else {
-                failed.push(NodeFailure::new(
-                    node,
-                    "the selected Node has no UID; refusing to dispatch to it".to_string(),
-                ));
+                failed.push(
+                    outcomes
+                        .failed(
+                            Some(&selected),
+                            node,
+                            "the selected Node has no UID; refusing to dispatch to it".to_string(),
+                        )
+                        .await,
+                );
                 continue;
             };
 
@@ -1056,22 +1092,34 @@ async fn run_fanout(
             let fresh = match node_ops.get(node).await {
                 Ok(fresh) => fresh,
                 Err(err) => {
-                    failed.push(NodeFailure::new(
-                        node,
-                        format!("could not re-read it before dispatch ({err:#})"),
-                    ));
+                    failed.push(
+                        outcomes
+                            .failed(
+                                Some(&selected),
+                                node,
+                                format!("could not re-read it before dispatch ({err:#})"),
+                            )
+                            .await,
+                    );
                     continue;
                 }
             };
             if fresh.metadata.uid.as_deref() != Some(expected_uid) {
-                failed.push(NodeFailure::new(
-                    node,
-                    format!(
-                        "was selected as UID {expected_uid} but now has UID {:?}; refusing to \
-                         mutate a replacement machine under a stale identity",
-                        fresh.metadata.uid
-                    ),
-                ));
+                failed.push(
+                    outcomes
+                        // No node object: the machine now answering to this
+                        // name was never acted on.
+                        .failed(
+                            None,
+                            node,
+                            format!(
+                                "was selected as UID {expected_uid} but now has UID {:?}; \
+                                 refusing to mutate a replacement machine under a stale identity",
+                                fresh.metadata.uid
+                            ),
+                        )
+                        .await,
+                );
                 continue;
             }
 
@@ -1089,12 +1137,17 @@ async fn run_fanout(
                 // under a running rollout is not an instruction to dismantle a
                 // host. A later run starts by cleaning what it owns but no longer
                 // selects, and picks this node up if it is still out.
-                failed.push(NodeFailure::new(
-                    node,
-                    "no longer matches the selection; refusing to act on a stale selection, \
-                     leaving the node as it is"
-                        .to_string(),
-                ));
+                failed.push(
+                    outcomes
+                        .failed(
+                            Some(&fresh),
+                            node,
+                            "no longer matches the selection; refusing to act on a stale \
+                             selection, leaving the node as it is"
+                                .to_string(),
+                        )
+                        .await,
+                );
                 continue;
             }
 
@@ -1106,45 +1159,64 @@ async fn run_fanout(
                     &template_admission(template),
                 );
                 if admitted.is_empty() {
-                    failed.push(NodeFailure::new(
-                        node,
-                        format!(
-                            "acquired the untolerated taint {} before dispatch; refusing to \
-                             start a Job the taint manager would evict",
-                            skipped
-                                .first()
-                                .map(|item| describe_taint(&item.taint))
-                                .unwrap_or_else(|| "<unknown>".to_string())
-                        ),
-                    ));
+                    failed.push(
+                        outcomes
+                            .failed(
+                                Some(&fresh),
+                                node,
+                                format!(
+                                    "acquired the untolerated taint {} before dispatch; refusing \
+                                     to start a Job the taint manager would evict",
+                                    skipped
+                                        .first()
+                                        .map(|item| describe_taint(&item.taint))
+                                        .unwrap_or_else(|| "<unknown>".to_string())
+                                ),
+                            )
+                            .await,
+                    );
                     continue;
                 }
             }
 
             let node_facts = NodeFacts::from_node(&fresh);
             if args.require_node_runtime_version && node_facts.container_runtime_version.is_none() {
-                failed.push(NodeFailure::new(
-                    node,
-                    "reports no containerRuntimeVersion and \
-                     --require-node-runtime-version is set"
-                        .to_string(),
-                ));
+                failed.push(
+                    outcomes
+                        .failed(
+                            Some(&fresh),
+                            node,
+                            "reports no containerRuntimeVersion and \
+                             --require-node-runtime-version is set"
+                                .to_string(),
+                        )
+                        .await,
+                );
                 continue;
             }
             if args.require_node_machine_id && node_facts.machine_id.is_none() {
-                failed.push(NodeFailure::new(
-                    node,
-                    "reports no machineID and --require-node-machine-id is set, so a \
-                     token-free Job could not defend against node-name reuse"
-                        .to_string(),
-                ));
+                failed.push(
+                    outcomes
+                        .failed(
+                            Some(&fresh),
+                            node,
+                            "reports no machineID and --require-node-machine-id is set, so a \
+                             token-free Job could not defend against node-name reuse"
+                                .to_string(),
+                        )
+                        .await,
+                );
                 continue;
             }
 
             // Fails the node rather than proceeding: for cleanup, proceeding would
             // dismantle a node still advertising itself as ready.
             if let Err(err) = node_ops.before_dispatch(node, expected_uid).await {
-                failed.push(NodeFailure::new(node, format!("{err:#}")));
+                failed.push(
+                    outcomes
+                        .failed(Some(&fresh), node, format!("{err:#}"))
+                        .await,
+                );
                 continue;
             }
 
@@ -1174,16 +1246,25 @@ async fn run_fanout(
                             info!("job {name} (node {node}) was left by an earlier run, recreated")
                         }
                         Err(err) => {
-                            failed.push(NodeFailure::new(node, format!("{err:#}")));
+                            failed.push(
+                                outcomes
+                                    .failed(Some(&fresh), node, format!("{err:#}"))
+                                    .await,
+                            );
                             continue;
                         }
                     }
                 }
                 Err(e) => {
-                    failed.push(NodeFailure::new(
-                        node,
-                        format!("its job {name} could not be created: {e}"),
-                    ));
+                    failed.push(
+                        outcomes
+                            .failed(
+                                Some(&fresh),
+                                node,
+                                format!("its job {name} could not be created: {e}"),
+                            )
+                            .await,
+                    );
                     continue;
                 }
             }
@@ -1198,7 +1279,15 @@ async fn run_fanout(
         // on the poll interval.
         if in_flight.is_empty() {
             if let Some(joined) = post_work.join_next_with_id().await {
-                record_post_work(joined, &mut post_nodes, &mut succeeded, &mut failed);
+                record_post_work(
+                    joined,
+                    &mut post_nodes,
+                    &mut succeeded,
+                    &mut failed,
+                    &outcomes,
+                    &by_name,
+                )
+                .await;
             }
             continue;
         }
@@ -1229,27 +1318,37 @@ async fn run_fanout(
                 // Waiting for a Job that no longer exists never ends, so the node
                 // fails and a later run retries it.
                 Ok(Err(kube::Error::Api(e))) if e.code == 404 => {
-                    failed.push(NodeFailure::new(
-                        &node,
-                        format!(
-                            "its job {name} no longer exists, so its result cannot be \
-                             established"
-                        ),
-                    ));
+                    failed.push(
+                        outcomes
+                            .failed(
+                                by_name.get(node.as_str()).copied(),
+                                &node,
+                                format!(
+                                    "its job {name} no longer exists, so its result cannot be \
+                                     established"
+                                ),
+                            )
+                            .await,
+                    );
                     finished.push(name);
                     continue;
                 }
                 Ok(Err(e)) => {
                     let since = unreadable[&name];
                     if since.elapsed() >= JOB_READ_ERROR_BUDGET {
-                        failed.push(NodeFailure::new(
-                            &node,
-                            format!(
-                                "its job {name} has been unreadable for {}s ({e}), so its \
-                                 result cannot be established",
-                                since.elapsed().as_secs()
-                            ),
-                        ));
+                        failed.push(
+                            outcomes
+                                .failed(
+                                    by_name.get(node.as_str()).copied(),
+                                    &node,
+                                    format!(
+                                        "its job {name} has been unreadable for {}s ({e}), so its \
+                                         result cannot be established",
+                                        since.elapsed().as_secs()
+                                    ),
+                                )
+                                .await,
+                        );
                         finished.push(name);
                     } else {
                         error!("failed to get job {name} (node {node}): {e}");
@@ -1259,16 +1358,21 @@ async fn run_fanout(
                 Err(_) => {
                     let since = unreadable[&name];
                     if since.elapsed() >= JOB_READ_ERROR_BUDGET {
-                        failed.push(NodeFailure::new(
-                            &node,
-                            format!(
-                                "its job {name} has been unreadable for {}s because its GET \
-                                 requests keep timing out after {}s, so its result cannot be \
-                                 established",
-                                since.elapsed().as_secs(),
-                                JOB_GET_TIMEOUT.as_secs()
-                            ),
-                        ));
+                        failed.push(
+                            outcomes
+                                .failed(
+                                    by_name.get(node.as_str()).copied(),
+                                    &node,
+                                    format!(
+                                        "its job {name} has been unreadable for {}s because its \
+                                         GET requests keep timing out after {}s, so its result \
+                                         cannot be established",
+                                        since.elapsed().as_secs(),
+                                        JOB_GET_TIMEOUT.as_secs()
+                                    ),
+                                )
+                                .await,
+                        );
                         finished.push(name);
                     } else {
                         error!(
@@ -1284,15 +1388,20 @@ async fn run_fanout(
                 JobOutcome::Succeeded => {
                     finished.push(name.clone());
                     info!("node {node}: job {name} succeeded");
-                    let Some(expected_uid) = nodes
-                        .iter()
-                        .find(|candidate| candidate.metadata.name.as_deref() == Some(node.as_str()))
+                    let Some(expected_uid) = by_name
+                        .get(node.as_str())
                         .and_then(|candidate| candidate.metadata.uid.clone())
                     else {
-                        failed.push(NodeFailure::new(
-                            &node,
-                            "the selected Node UID is gone from dispatcher state".to_string(),
-                        ));
+                        failed.push(
+                            outcomes
+                                .failed(
+                                    None,
+                                    &node,
+                                    "the selected Node UID is gone from dispatcher state"
+                                        .to_string(),
+                                )
+                                .await,
+                        );
                         continue;
                     };
                     let ops = node_ops.clone();
@@ -1304,10 +1413,15 @@ async fn run_fanout(
                 JobOutcome::Failed => {
                     // Read now, before the Job's TTL takes the pod away.
                     let why = diagnosis::why_the_job_failed(&pods, &j, &name).await;
-                    failed.push(NodeFailure::new(
-                        &node,
-                        format!("its job {name} failed: {why}"),
-                    ));
+                    failed.push(
+                        outcomes
+                            .failed(
+                                by_name.get(node.as_str()).copied(),
+                                &node,
+                                format!("its job {name} failed: {why}"),
+                            )
+                            .await,
+                    );
                     finished.push(name);
                 }
                 JobOutcome::Running => {}
@@ -1319,7 +1433,15 @@ async fn run_fanout(
         }
 
         while let Some(joined) = post_work.try_join_next_with_id() {
-            record_post_work(joined, &mut post_nodes, &mut succeeded, &mut failed);
+            record_post_work(
+                joined,
+                &mut post_nodes,
+                &mut succeeded,
+                &mut failed,
+                &outcomes,
+                &by_name,
+            )
+            .await;
         }
 
         info!(
@@ -1664,11 +1786,13 @@ async fn replace_job(jobs: &Api<Job>, name: &str, desired: &Job) -> Result<()> {
 
 /// A node whose Job passed but whose post-success work did not is a failed node:
 /// the work is only complete once the node is labelled.
-fn record_post_work(
+async fn record_post_work(
     joined: std::result::Result<(tokio::task::Id, Result<()>), tokio::task::JoinError>,
     post_nodes: &mut HashMap<tokio::task::Id, String>,
     succeeded: &mut usize,
     failed: &mut Vec<NodeFailure>,
+    outcomes: &Outcomes,
+    by_name: &HashMap<&str, &Node>,
 ) {
     let (id, outcome) = match joined {
         Ok((id, outcome)) => (id, outcome),
@@ -1677,14 +1801,20 @@ fn record_post_work(
     let node = post_nodes
         .remove(&id)
         .unwrap_or_else(|| "<unknown>".to_string());
+    let object = by_name.get(node.as_str()).copied();
 
     match outcome {
-        Ok(()) => *succeeded += 1,
+        Ok(()) => {
+            *succeeded += 1;
+            info!("node {node}: done");
+            outcomes.succeeded(object).await;
+        }
         Err(err) => {
-            failed.push(NodeFailure::new(
-                &node,
-                format!("its Job finished but {err:#}"),
-            ));
+            failed.push(
+                outcomes
+                    .failed(object, &node, format!("its Job finished but {err:#}"))
+                    .await,
+            );
         }
     }
 }
