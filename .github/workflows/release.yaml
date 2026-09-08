@@ -118,7 +118,7 @@ jobs:
       # dev-dependencies too, which are in nothing shipped.
       - name: Install the pinned Rust toolchain
         uses: ./.github/actions/rust-toolchain
-      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
+      - uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2.87.2
         with:
           tool: cargo-sbom@0.10.0
 
